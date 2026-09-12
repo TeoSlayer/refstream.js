@@ -1,75 +1,101 @@
+/** Public browser and buffer contracts. Importing these requires no DOM. */
+import type { TerminalFileLinkOptions } from "./file-preview.js";
+import type { TerminalThemeName } from "./themes.js";
 export interface Disposable { dispose(): void }
-export type FilePurpose = "preview" | "download";
-export interface FileRequest { purpose: FilePurpose; signal: AbortSignal }
-export interface FileDescriptor {
-  /** Opaque capability for a registered source. It is not a URL or a filesystem path. */
-  id: string;
-  reference: string;
-  name: string;
-  mimeType: string;
-  size?: number;
-}
-export interface ResolvedFile {
-  name: string;
-  mimeType: string;
-  size?: number;
-  body: ReadableStream<Uint8Array>;
-}
-export interface FileSource {
-  has(reference: string): boolean;
-  list(): readonly FileDescriptor[];
-  resolve(reference: string, request: FileRequest): Promise<ResolvedFile | null>;
-  onChange(listener: () => void): Disposable;
-}
-/** Supply exactly one backing. Stream factories must return a fresh stream per read. */
-export interface FileBacking {
-  body?: Blob | string;
-  stream?(request: FileRequest): ReadableStream<Uint8Array> | Promise<ReadableStream<Uint8Array>>;
-  url?: string;
-  mimeType?: string;
-  size?: number;
-}
-export interface RegisteredFile extends FileBacking {
-  name?: string;
-  preview?: FileBacking;
-  /** Rechecked for every preview and download, before opening the backing. */
-  authorize?(request: FileRequest): boolean | Promise<boolean>;
-}
-export type FileErrorCode = "UNAVAILABLE" | "DENIED" | "LIMIT" | "ABORTED" | "TIMEOUT" | "DISCONNECTED" | "PROTOCOL";
-const messages: Record<FileErrorCode, string> = {
-  UNAVAILABLE: "File unavailable.", DENIED: "File access denied.", LIMIT: "File or transfer limit exceeded.",
-  ABORTED: "File request cancelled.", TIMEOUT: "File request timed out.", DISCONNECTED: "File peer disconnected.", PROTOCOL: "Invalid file protocol message.",
-};
-export class FileAccessError extends Error {
-  constructor(readonly code: FileErrorCode) { super(messages[code]); this.name = "FileAccessError"; }
-}
-export class ChangeSignal {
-  private listeners = new Set<() => void>();
-  readonly subscribe = (listener: () => void): Disposable => { this.listeners.add(listener); return { dispose: () => { this.listeners.delete(listener); } }; };
-  fire(): void { for (const listener of [...this.listeners]) listener(); }
+
+export class Signal<T> {
+  private listeners = new Set<(event: T) => void>();
+  readonly event = (listener: (event: T) => void): Disposable => {
+    this.listeners.add(listener);
+    return { dispose: () => { this.listeners.delete(listener); } };
+  };
+  fire(event: T): void { for (const listener of this.listeners) listener(event); }
   dispose(): void { this.listeners.clear(); }
 }
-export const validReference = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 1024 && !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(value);
-export const validId = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{32}$/u.test(value);
-export const validSize = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
-export function boundedNumber(value: number | undefined, fallback: number, min: number, max: number): number {
-  if (value === undefined) return fallback;
-  if (!Number.isSafeInteger(value) || value < min || value > max) throw new RangeError("Invalid file resource limit");
-  return value;
+
+export interface TerminalTheme {
+  colorScheme?: "dark" | "light";
+  foreground?: string; background?: string; cursor?: string; cursorAccent?: string;
+  selectionBackground?: string; selectionInactiveBackground?: string;
+  black?: string; red?: string; green?: string; yellow?: string;
+  blue?: string; magenta?: string; cyan?: string; white?: string;
+  brightBlack?: string; brightRed?: string; brightGreen?: string; brightYellow?: string;
+  brightBlue?: string; brightMagenta?: string; brightCyan?: string; brightWhite?: string;
 }
-export function abortable<T>(promise: Promise<T>, signal: AbortSignal, late?: (value: T) => void): Promise<T> {
-  return new Promise((resolve, reject) => {
-    let cancelled = signal.aborted;
-    const abort = () => { cancelled = true; reject(signal.reason instanceof FileAccessError ? signal.reason : new FileAccessError("ABORTED")); };
-    if (cancelled) abort(); else signal.addEventListener("abort", abort, { once: true });
-    promise.then(value => { signal.removeEventListener("abort", abort); if (cancelled) { try { late?.(value); } catch { /* The cancelled operation no longer owns this result. */ } } else resolve(value); }, error => { signal.removeEventListener("abort", abort); if (!cancelled) reject(error); });
-  });
+
+export interface TerminalOptions {
+  /** Initial grid and retained history. Use resize() to change the grid. */
+  readonly cols?: number; readonly rows?: number; readonly scrollback?: number;
+  /** Initial newline mode. A host may subsequently change it using VT sequences. */
+  readonly convertEol?: boolean;
+  fontFamily?: string; fontSize?: number;
+  lineHeight?: number; letterSpacing?: number; theme?: TerminalTheme | TerminalThemeName;
+  cursorBlink?: boolean; cursorStyle?: "block" | "underline" | "bar";
+  cursorInactiveStyle?: "outline" | "block" | "bar" | "underline" | "none";
+  disableStdin?: boolean; drawBoldTextInBrightColors?: boolean;
+  /** On macOS, send Option as ESC-prefixed input instead of composing characters. */
+  macOptionIsMeta?: boolean; scrollOnUserInput?: boolean;
+  fontWeight?: "normal" | "bold" | "100" | "200" | "300" | "400" | "500" | "600" | "700" | "800" | "900" | number;
+  fontWeightBold?: TerminalOptions["fontWeight"];
+  /** Detect plain HTTP(S) URLs in output. Explicit OSC 8 links remain supported. Default true. */
+  linkify?: boolean;
+  /** Opt-in file references and previews. Detection never grants file access. */
+  fileLinks?: TerminalFileLinkOptions;
 }
-/** Synchronous detection is a map lookup; only an explicit resolve opens a source. */
-export function fileLinks(source: FileSource) {
-  return {
-    canResolve(reference: { path: string }): boolean { return source.has(reference.path); },
-    onChange(listener: () => void): Disposable { return source.onChange(listener); },
-    resolve(reference: { path: string }, request: FileRequest): Promise<ResolvedFile | null> { return source.resolve(reference.path, request); },
-  };
+
+export interface TerminalSize { cols: number; rows: number }
+export interface TerminalCellMetrics { width: number; height: number; scrollbar: number }
+
+export interface ReadableCell {
+  getChars(): string;
+  getWidth(): number;
+}
+
+export interface ReadableLine {
+  readonly isWrapped: boolean;
+  readonly length: number;
+  getCell(column: number): ReadableCell | undefined;
+  translateToString(trimRight?: boolean, startColumn?: number, endColumn?: number): string;
+}
+
+export interface ReadableBuffer {
+  readonly type: "normal" | "alternate";
+  readonly baseY: number;
+  readonly viewportY: number;
+  readonly cursorX: number;
+  readonly cursorY: number;
+  readonly length: number;
+  getLine(row: number): ReadableLine | undefined;
+}
+
+export interface TerminalSurface {
+  readonly cols: number;
+  readonly rows: number;
+  readonly element: HTMLElement | undefined;
+  readonly textarea: HTMLTextAreaElement | undefined;
+  options: TerminalOptions;
+  readonly buffer: { readonly active: ReadableBuffer };
+  readonly modes: { readonly mouseTrackingMode: string; readonly applicationCursorKeysMode: boolean };
+  open(element: HTMLElement): void;
+  write(data: string | Uint8Array, callback?: () => void): void;
+  reset(): void;
+  resize(cols: number, rows: number): void;
+  refresh(start: number, end: number): void;
+  focus(): void;
+  blur(): void;
+  dispose(): void;
+  paste(data: string): void;
+  scrollLines(lines: number): void;
+  scrollToLine(line: number): void;
+  scrollToBottom(): void;
+  hasSelection(): boolean;
+  getSelection(): string;
+  clearSelection(): void;
+  select(column: number, row: number, length: number): void;
+  attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void;
+  onData(listener: (data: string) => void): Disposable;
+  onBinary(listener: (data: string) => void): Disposable;
+  onTitleChange(listener: (title: string) => void): Disposable;
+  onScroll(listener: (position: number) => void): Disposable;
+  onRender(listener: (range: { start: number; end: number }) => void): Disposable;
 }

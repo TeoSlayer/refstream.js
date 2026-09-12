@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { detectFiles, fileLinks, FileRegistry, FileAccessError, createFilePeer, type Disposable } from "../src/index.js";
+import { detectFiles, fileLinks, FileRegistry, FileAccessError, createFilePeer, type Disposable } from "../../../src/files/index.js";
 
 const owned: Disposable[] = [];
 const registry = (options: ConstructorParameters<typeof FileRegistry>[0] = {}) => { const value = new FileRegistry(options); owned.push(value); return value; };

@@ -1,8 +1,8 @@
 import { expect, test, firefox, webkit, type Page } from '@playwright/test';
-import type * as FilesApi from '../../src/index.js';
+import type * as FilesApi from '../../src/files/index.js';
 
-const fileModule = '/dist/browser/refstream.js';
-declare global { interface Window { fileTestPeer: FilesApi.FilePeer; Refstream: typeof FilesApi } }
+const fileModule = '/dist/browser/files.js';
+declare global { interface Window { fileTestPeer: FilesApi.FilePeer; RefstreamFiles: typeof FilesApi } }
 
 test("real WebRTC transfers preserve bytes, apply backpressure, and cancel the producer", async ({ page }) => {
   test.setTimeout(45_000);
@@ -41,9 +41,9 @@ test("real WebRTC transfers preserve bytes, apply backpressure, and cancel the p
 
 test("ships a standalone browser global without module loaders or runtime dependencies", async ({ page }) => {
   await page.goto("/test/browser/index.html");
-  await page.addScriptTag({ url: fileModule.replace("refstream.js", "refstream.global.js") });
+  await page.addScriptTag({ url: fileModule.replace("files.js", "files.global.js") });
   const result = await page.evaluate(async () => {
-    const { FileRegistry, detectFiles } = window.Refstream;
+    const { FileRegistry, detectFiles } = window.RefstreamFiles;
     const files = new FileRegistry(); files.add("README.md", { body: "Browser JavaScript" });
     const matched = detectFiles("README.md:1 and missing.txt", files).map(match => match.text);
     const text = await new Response((await files.resolve("README.md", { purpose: "download", signal: new AbortController().signal }))!.body).text(); files.dispose();

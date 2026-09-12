@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { FileChannel, FileRegistry, FILE_CHANNEL_PROTOCOL, type Disposable, type FileChannelOptions } from "../src/index.js";
+import { FileChannel, FileRegistry, FILE_CHANNEL_PROTOCOL, type Disposable, type FileChannelOptions } from "../../../src/files/index.js";
 
 class Wire extends EventTarget {
   protocol = FILE_CHANNEL_PROTOCOL; ordered = true; maxRetransmits = null; maxPacketLifeTime = null;

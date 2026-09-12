@@ -1,0 +1,5 @@
+* { box-sizing: border-box; }
+body { margin: 16px; background: #11151b; color: #dfe4ed; font: 16px system-ui; }
+#terminal { width: 100%; max-width: 800px; height: 320px; margin-top: 16px; }
+button { min-height: 44px; }
+iframe { width: 340px; height: 240px; border: 0; }

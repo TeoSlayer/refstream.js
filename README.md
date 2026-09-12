@@ -1,185 +1,187 @@
 # Refstream.js
 
-A small, independent JavaScript library for file references backed by **Web Streams, Blobs, explicit URLs, or WebRTC peer-to-peer streams**. Use it with Shell Terminal or your own interface. No UI framework, runtime dependencies, telemetry, automatic network connections, or filesystem access.
+A standalone JavaScript terminal emulator. Refstream owns the VT parser, screen
+buffers, Unicode cells, input protocols and virtualized browser renderer. Use
+`Terminal` wherever your application needs to render a shell or terminal process.
+It has **zero runtime dependencies** and does not use xterm.js to render.
 
-This is an alpha library. Browser JavaScript and npm distribution formats are built and tested here; the npm package has not been published yet.
+The optional `refstream.js/files` module adds backed file references and WebRTC
+streams. It is an extension to Refstream's terminal, not the main library.
 
-## Load JavaScript
+## Use in a browser
 
-Copy `dist/browser/` to your static host. The ES module is self-contained:
+Build with `npm ci && npm run build`, then serve the contents of `dist/browser/`
+on any static host. Keep the `chunks/` directory alongside the JavaScript files.
+Consumers need only JavaScript and CSS, with no framework, Node.js or build step.
 
-```js
-import { FileRegistry, fileLinks, createFilePeer } from '/vendor/refstream/refstream.js';
+```html
+<link rel="stylesheet" href="/sdk/refstream.css">
+<div id="terminal" style="height:400px"></div>
+<script type="module">
+  import { Terminal } from '/sdk/refstream.js';
+
+  const terminal = new Terminal({ theme: 'midnight', fontSize: 14 });
+  terminal.open(document.querySelector('#terminal'));
+  terminal.fit();
+  terminal.write('Hello, \x1b[32mworld\x1b[0m!\r\n');
+</script>
 ```
 
-Or load `refstream.global.js` with a regular script tag and use `window.Refstream`. No bundler or installer is required. Serve JavaScript with its correct MIME type; permit cross-origin module loading only if needed. Run `npm ci && npm run build` to produce the browser files. Keep the MIT license with them.
+For classic script tags, load `refstream.global.js` and use
+`new Refstream.Terminal(options)`. The browser modules and global are built from
+the same terminal engine.
 
-For npm/bundler use after publication:
+## Replace xterm in an application
 
-```sh
-npm install refstream.js
-```
-
-```js
-import { FileRegistry, fileLinks, createFilePeer } from 'refstream.js';
-```
-
-## Register actual sources
-
-Only explicit registrations can become file links. Detection and `has()` are local lookups; they never open a stream or fetch a URL.
+The main API follows familiar terminal conventions: `new Terminal(options)`,
+`open`, `write`, `onData`, `onBinary`, `onResize`, `resize`, `focus`, selection,
+scrolling and `dispose`. Refstream also includes `fit()` directly.
 
 ```js
-const files = new FileRegistry({
-  allowedOrigins: ['https://files.example.com'],
-});
+import { Terminal } from 'refstream.js';
+import 'refstream.js/style.css';
 
-files.add('README.md', { body: '# Project notes\n' });
-files.add('report.pdf', { body: reportBlob, mimeType: 'application/pdf' });
-files.add('build.log', {
-  mimeType: 'text/plain',
-  // Return a fresh ReadableStream<Uint8Array> each time.
-  stream: ({ signal, purpose }) => openAuthorizedLogStream({ signal, purpose }),
-});
-const registration = files.add('plots/results.png', {
-  url: 'https://files.example.com/opaque-file-id',
-  mimeType: 'image/png',
-  preview: { body: thumbnailBlob },
-  // Check permissions again for every preview and download.
-  authorize: ({ purpose }) => sessionMayReadFile('opaque-file-id', purpose),
-});
+const terminal = new Terminal({ cols: 80, rows: 24, scrollback: 10_000 });
+terminal.open(container);
 
-// Withdrawal removes detection and cancels active reads.
-registration.dispose();
-// On application/session teardown:
-files.dispose();
-```
+// Keep your application's authenticated PTY transport.
+const input = terminal.onData(data => transport.send(new TextEncoder().encode(data)));
+const binary = terminal.onBinary(data => transport.send(
+  Uint8Array.from(data, character => character.charCodeAt(0)),
+));
+const resize = terminal.onResize(({ cols, rows }) => transport.resize(cols, rows));
+transport.onOutput(bytes => terminal.write(bytes));
 
-Supply exactly one backing per file (and per optional preview): a string/Blob `body`, a `stream` factory, or an absolute HTTP(S) `url`. A preview can be a smaller image, a text excerpt or another supported file. Without a separate preview, previews read the normal backing under their own byte limit.
+const observer = new ResizeObserver(() => terminal.fit());
+observer.observe(container);
+terminal.fit();
+terminal.focus();
 
-URL sources require an exact origin allowlist and are fetched without cookies, credentials, referrers, redirects, or caching. For authenticated HTTP endpoints, supply your own stream factory that authorizes the user, session and file on every request. **Never construct a fetch URL or filesystem path from detected text.** Register the mapping from a trusted application catalog.
-
-## Connect a terminal or your own UI
-
-```js
-// An existing Shell Terminal instance:
-terminal.options.fileLinks = {
-  ...fileLinks(files),
-  hoverDelayMs: 300,
-  ui: { actions: ['download', 'close'] },
-};
-```
-
-The adapter supplies local availability, resolution and change events. Adding or withdrawing a source updates links automatically; a revoked preview closes. Only registered paths link. The terminal owns its customizable preview/download UI; this library owns the file sources.
-
-For another interface:
-
-```js
-import { detectFiles } from '/vendor/refstream/refstream.js';
-
-const matches = detectFiles('Created plots/results.png and README.md:4', files);
-// Each match has start/end UTF-16 offsets, text, file metadata, and optional line/column.
-
-const abort = new AbortController();
-const file = await files.resolve('README.md', {
-  purpose: 'download',
-  signal: abort.signal,
-});
-if (file) await file.body.pipeTo(yourWritableStream);
-// Or consume with new Response(file.body).text()/blob() for bounded small files.
-// AbortSignal or file.body.cancel() cancels the upstream read.
-```
-
-Render names and text as text, not HTML. `detectFiles()` matches only explicitly registered references, including filenames with spaces and `:line:column`, `#LlineCcolumn`, or `(line,column)` suffixes. It bounds work to 8,192 UTF-16 code units, 256 registered files and 32 results. It does not discover files or grant permission. `list()` exposes display references and metadata, never backing URLs or file contents.
-
-## Peer-to-peer streams
-
-File bytes travel over an encrypted WebRTC data channel. Your application authenticates the two peers and exchanges the offer and answer through its existing HTTPS/WebSocket signaling. No signaling service, STUN server or TURN server is hardcoded into the library.
-
-On the computer/browser sharing files:
-
-```js
-const sender = createFilePeer({
-  files: filesForThisAuthorizedViewer,
-  rtcConfiguration: yourRtcConfiguration,
-});
-try {
-  const offer = await sender.createOffer();
-  // Host-defined request: deliver only to the authorized viewer.
-  const answer = await authenticatedSignaling.exchangeOffer(offer);
-  await sender.acceptAnswer(answer);
-  await sender.ready;
-} catch (error) {
-  sender.dispose();
-  throw error;
+// On unmount, also detach your transport's output listener.
+function dispose() {
+  observer.disconnect();
+  input.dispose(); binary.dispose(); resize.dispose();
+  terminal.dispose();
 }
 ```
 
-On the viewing page:
+`container` and `transport` above belong to your application. Like other terminal
+emulators, Refstream displays terminal output and emits input; your PTY or browser
+runtime executes commands. Refstream does not install a server or choose one.
+
+**Version 0.1 alpha:** the terminal works independently of xterm. Compatibility
+with every xterm escape sequence and addon is not complete. Applications using
+xterm addons or private APIs need to adapt them; this is not binary compatibility
+with its addon ecosystem. The package includes xterm only as a development test
+dependency to compare terminal behavior.
+
+The npm package name is `refstream.js`; it is not published on npm yet. The build
+ships browser JavaScript, ESM, CommonJS, TypeScript declarations, CSS and source
+maps. `npm pack` produces a self-contained npm distribution without install hooks.
+
+## Terminal features
+
+- Normal and alternate screen buffers, bounded scrollback, resize and reflow,
+  cursor movement, colors and text attributes, scrolling regions and tab stops.
+- Streaming UTF-8, wide characters and combining sequences; keyboard input,
+  IME composition, bracketed paste, selection, mouse reporting and touch input.
+- Virtualized DOM rows, native scrolling, batched painting, eight built-in themes
+  and runtime appearance options.
+- Command markers, searchable output, session snapshots and recording/replay.
+- HTTP(S) links and opt-in file previews with a host-provided source of bytes.
+
+`write()` updates the model synchronously and batches painting into an animation
+frame. Its callback runs after parsing, not after display refresh. Use `onRender`
+to observe rendering. Chunk large output streams and yield between writes to
+keep browser input responsive.
+
+## State, search and replay
 
 ```js
-const viewer = createFilePeer({ rtcConfiguration: yourRtcConfiguration });
-try {
-  const answer = await viewer.acceptOffer(offerFromAuthenticatedSender);
-  await authenticatedSignaling.sendAnswer(answer);
-  await viewer.ready;
-  terminal.options.fileLinks = fileLinks(viewer);
-} catch (error) {
-  viewer.dispose();
-  throw error;
-}
+import { TerminalSession, findInTerminal, terminalTranscript } from 'refstream.js';
 
-// On disconnect/unmount: viewer.dispose(); sender.dispose();
+const session = new TerminalSession(terminal);
+const snapshot = session.snapshot();
+session.restore(snapshot);
+
+const matches = findInTerminal(terminal.buffer.active, terminal.cols, 'error');
+const text = terminalTranscript(terminal.buffer.active);
+const commands = session.read().commands;
+// session.dispose() when the session ends.
 ```
 
-Each peer advertises only its explicitly supplied registry. Create a separate scoped registry when viewers have different permissions. The receiving peer resolves detected references locally against that catalog, then requests the registered opaque file ID. Backing URLs, authentication credentials and unregistered paths never enter the file protocol. `authorize` still runs on the sender for every preview/download.
+Snapshots retain the parser state, buffers, cursor, modes and command records.
+They contain terminal output and should be protected like the underlying session.
+`TerminalRecorder` and `replayRecording` record and replay output and resize events.
+The optional Bash/Zsh scripts in `shell-integration/` emit OSC 133 command markers
+for exit status and command timing; arbitrary plain output cannot supply reliable
+command boundaries on its own.
 
-Offer/answer exchange is **application code**, not a built-in agent tool. Bind signaling to authenticated users and sessions, and do not log or publicly expose descriptions; connection descriptions can contain network addresses. WebRTC encrypts transport but does not replace your application’s authorization. For internet use, explicitly configure your own STUN/TURN infrastructure; some networks require TURN, which relays encrypted traffic. The empty default supports direct connectivity where available. Failed connections fail explicitly; the library never silently uploads a file or falls back to a URL.
+## Optional interface
 
-If your app already has WebRTC, use `new FileChannel(dataChannel, { files })`. Create the channel with `{ ordered: true, protocol: FILE_CHANNEL_PROTOCOL }` and default reliability. Both endpoints must attach a `FileChannel` before exchanging traffic.
+```js
+import { attachTerminalTools } from 'refstream.js/ui';
+import 'refstream.js/ui/style.css';
 
-## Bounds and lifecycle
-
-| Option | Registry default | Peer/channel default |
-| --- | --- | --- |
-| `maxPreviewBytes` | 16 MiB | 16 MiB |
-| `maxDownloadBytes` | 128 MiB | 128 MiB |
-| `timeoutMs` | 60 seconds idle | 30 seconds idle |
-| Concurrency | `maxConcurrentReads: 8` | `maxConcurrentTransfers: 4` in each direction |
-| Catalog size | `maxFiles: 256` | 256 shared files |
-| `connectionTimeoutMs` | — | 30 seconds, including signaling |
-
-Preview limits can be configured up to 128 MiB; download limits up to 1 GiB. Actual streamed bytes enforce the cap regardless of size metadata. Stream factories should emit moderate chunks; the sender retains at most one upstream chunk per transfer and sends one binary message (at most 16 KiB) for each consumer credit. Readers that stop consuming must cancel the stream, or the idle timeout will release it. Slow consumers never create an unbounded output queue.
-
-Registry disposal withdraws sources and aborts active reads. Peer/channel disposal cancels transfers and closes its connection; it does not dispose an application-owned registry. Connection loss fails outstanding reads. Reconnection and retry require a new peer and freshly authorized stream; there is no silent resume or persistent storage. `FileAccessError.code` reports `UNAVAILABLE`, `DENIED`, `LIMIT`, `ABORTED`, `TIMEOUT`, `DISCONNECTED`, or `PROTOCOL`, without exposing source exception details.
-
-The library uses standard Web Streams, `fetch`, AbortController and WebRTC data channels. Serve peer connections from HTTPS or localhost. Automated browser tests exercise Chromium, Firefox, WebKit and mobile browser profiles; physical devices, internet NAT traversal and your own TURN infrastructure need deployment-specific verification.
-
-## Build and verify
-
-```sh
-npm ci
-npm run build
-npm test
-npm run test:package
+const tools = await attachTerminalTools({
+  terminal, toolbar, overlay, frame,
+  ui: {
+    toolbar: ['search', 'menu'],
+    themes: ['midnight', 'paper', 'shell'],
+    labels: { search: 'Find' },
+  },
+});
+// tools.dispose() when removing the interface.
 ```
 
-Use Node.js 22 or newer for development. The package contains ESM, CommonJS, standalone browser JS and TypeScript declarations, with no runtime dependencies or install-time compilation. An isolated consumer test verifies the packaged artifacts without source files.
+Supply your own elements for `toolbar`, `overlay` and `frame`. Controls, menu
+items, labels, themes and file-preview rendering are configurable. The engine
+does not require this UI module. Custom colors can be set through
+`terminal.options.theme`; named themes are exported by `refstream.js/themes`.
 
-For real WebRTC and browser distribution tests:
+## Optional backed files
 
-```sh
-npx playwright install chromium firefox webkit
-npm run test:browser
+```js
+import { FileRegistry, fileLinks } from 'refstream.js/files';
+
+const files = new FileRegistry();
+files.add('reports/build.txt', { body: 'Build passed.\n' });
+terminal.options.fileLinks = fileLinks(files);
+terminal.write('reports/build.txt\r\n');
+// files.dispose() when access ends.
 ```
 
-Tests include Chromium, Firefox, WebKit, mobile browser profiles, and Chromium-to-Firefox/WebKit transfers. The library is headless. The browser fixture exercises its public API. Nothing is published to npm by these commands.
+Only explicitly backed paths become file links. Hover/focus previews the file;
+Download resolves it again so the host can reauthorize the read. Sources can be
+strings, Blobs, URLs or lazy streams, including authenticated peer-to-peer streams.
+See the [file API](docs/files.md) for WebRTC signaling, limits and authorization.
 
-Build output belongs in `dist/`; it is not committed. CI verifies packaging on Linux, macOS and Windows, plus real browser transfers.
+Detection alone never fetches a path. URL access is opt-in, with exact origin
+allowlists, no ambient credentials and no redirects. Active documents are not
+executed in previews. Preview bytes and resolved URLs are excluded from terminal
+snapshots and recordings. The host still owns authorization for every resource.
 
-Keep stable version paths immutable. Self-host with any static server or CDN, correct JavaScript MIME types, `nosniff`, and explicit CORS policy. Return 404 for missing modules instead of an HTML application fallback. No worker or backend is required for file registries; P2P deployment needs your authenticated signaling and any configured ICE services.
+## Modules and validation
 
-Protocol references: [WebRTC data channels](https://www.w3.org/TR/webrtc/#rtcdatachannel), [Web Streams](https://streams.spec.whatwg.org/).
+| Module | Purpose |
+| --- | --- |
+| `refstream.js` | Terminal renderer, sessions, commands, input and recording |
+| `refstream.js/core` | Headless VT parser and screen buffers |
+| `refstream.js/search` | Buffer search and transcript helpers |
+| `refstream.js/themes` | Built-in themes and theme resolution |
+| `refstream.js/ui` | Optional terminal controls |
+| `refstream.js/files` | Optional backed references and WebRTC streams |
+| `refstream.js/relay` | Optional agent relay configuration |
 
-Refstream.js originated as the independent file-source library in [Shell.online](https://github.com/TeoSlayer/shell.online). It has no dependency on the terminal, its relay, or Cloudflare. Licensed under [MIT](LICENSE).
+`npm run check` builds, runs unit/conformance tests and verifies the packed library
+in isolated ESM, CommonJS and TypeScript consumers with no xterm installed.
+`npm run test:browser` exercises Chromium, Firefox and WebKit, plus Android and iOS
+viewport/touch profiles. Mobile profiles are emulation, not physical-device tests.
+Local peer tests use direct host ICE candidates; internet NAT traversal and your
+signaling/TURN infrastructure require separate deployment checks.
 
-Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/TeoSlayer/refstream.js/security/advisories/new). Do not include credentials or private file contents in public issues.
+Importing the library starts no network requests, storage or telemetry. Agent
+connections and peer connections are explicit, optional operations. Report
+security issues through [private vulnerability reporting](https://github.com/TeoSlayer/refstream.js/security/advisories/new).
+
+MIT licensed.

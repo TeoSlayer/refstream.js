@@ -1,12 +1,23 @@
 {
   "name": "refstream.js",
-  "version": "0.1.0-alpha.1",
-  "description": "File references backed by URLs, Web Streams and peer-to-peer WebRTC streams.",
+  "version": "0.1.0-alpha.2",
+  "description": "An independent JavaScript terminal emulator with command state, customizable UI and optional peer-to-peer file streams.",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/TeoSlayer/refstream.js#readme",
-  "bugs": {
-    "url": "https://github.com/TeoSlayer/refstream.js/issues"
+  "keywords": [
+    "terminal",
+    "terminal-emulator",
+    "javascript",
+    "vt",
+    "ansi",
+    "typescript",
+    "webrtc",
+    "terminal-renderer",
+    "file-references"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "main": "./dist/cjs/index.js",
   "module": "./dist/index.js",
@@ -22,45 +33,108 @@
         "default": "./dist/cjs/index.js"
       }
     },
+    "./core": {
+      "import": {
+        "types": "./dist/core.d.ts",
+        "default": "./dist/core.js"
+      },
+      "require": {
+        "types": "./dist/cjs/core.d.ts",
+        "default": "./dist/cjs/core.js"
+      }
+    },
+    "./style.css": "./dist/style.css",
+    "./search": {
+      "import": {
+        "types": "./dist/search.d.ts",
+        "default": "./dist/search.js"
+      },
+      "require": {
+        "types": "./dist/cjs/search.d.ts",
+        "default": "./dist/cjs/search.js"
+      }
+    },
+    "./global": "./dist/refstream.global.js",
+    "./package.json": "./package.json",
+    "./ui": {
+      "import": {
+        "types": "./dist/ui.d.ts",
+        "default": "./dist/ui.js"
+      },
+      "require": {
+        "types": "./dist/cjs/ui.d.ts",
+        "default": "./dist/cjs/ui.js"
+      }
+    },
+    "./themes": {
+      "import": {
+        "types": "./dist/themes.d.ts",
+        "default": "./dist/themes.js"
+      },
+      "require": {
+        "types": "./dist/cjs/themes.d.ts",
+        "default": "./dist/cjs/themes.js"
+      }
+    },
+    "./relay": {
+      "import": {
+        "types": "./dist/relay.d.ts",
+        "default": "./dist/relay.js"
+      },
+      "require": {
+        "types": "./dist/cjs/relay.d.ts",
+        "default": "./dist/cjs/relay.js"
+      }
+    },
+    "./ui/style.css": "./dist/ui.css",
     "./browser/*": "./dist/browser/*",
-    "./package.json": "./package.json"
+    "./files": {
+      "import": {
+        "types": "./dist/files/index.d.ts",
+        "default": "./dist/files/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/files/index.d.ts",
+        "default": "./dist/cjs/files/index.js"
+      }
+    }
   },
   "files": [
     "dist",
     "src",
+    "shell-integration",
+    "docs",
     "README.md",
     "LICENSE"
   ],
-  "sideEffects": false,
-  "publishConfig": {
-    "access": "public"
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TeoSlayer/refstream.js.git"
   },
-  "keywords": [
-    "files",
-    "file-references",
-    "web-streams",
-    "webrtc",
-    "peer-to-peer",
-    "javascript",
-    "typescript"
-  ],
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "vitest run --config vitest.config.ts",
     "test:package": "node scripts/test-package.mjs",
-    "prepack": "npm run build && npm test && npm run test:package",
+    "test:browser": "playwright test --config playwright.config.ts",
+    "prepack": "npm run check",
     "check": "npm run build && npm test && npm run test:package",
-    "pretest:browser": "npm run build",
-    "test:browser": "playwright test"
+    "pretest:browser": "npm run build"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@xterm/xterm": "6.0.0",
     "esbuild": "0.28.2",
+    "happy-dom": "20.14.3",
     "typescript": "~6.0.2",
-    "vitest": "^4.1.11",
-    "@playwright/test": "^1.63.0"
+    "vitest": "^4.1.11"
+  },
+  "bugs": {
+    "url": "https://github.com/TeoSlayer/refstream.js/issues"
   }
 }
