@@ -10,8 +10,10 @@ streams. It is an extension to Refstream's terminal, not the main library.
 
 ## Use in a browser
 
-Build with `npm ci && npm run build`, then serve the contents of `dist/browser/`
-on any static host. Keep the `chunks/` directory alongside the JavaScript files.
+Download the compiled JavaScript and CSS from
+[Releases](https://github.com/TeoSlayer/refstream.js/releases), or build with
+`npm ci && npm run build`. Serve the browser files on any static host. Keep the
+`chunks/` directory alongside the JavaScript files.
 Consumers need only JavaScript and CSS, with no framework, Node.js or build step.
 
 ```html

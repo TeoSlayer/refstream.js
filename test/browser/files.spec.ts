@@ -55,7 +55,8 @@ test("ships a standalone browser global without module loaders or runtime depend
 for (const remote of [firefox, webkit]) test(`peer files interoperate between Chromium and ${remote.name()}`, async ({ page, browserName, isMobile }) => {
   test.skip(browserName !== "chromium" || isMobile, "The desktop Chromium project owns cross-engine pairs.");
   test.setTimeout(45_000);
-  const browser = await remote.launch(); let other: Page | undefined;
+  // Do not inherit Chromium's host-ICE launch flags in a different browser.
+  const browser = await remote.launch({ args: [] }); let other: Page | undefined;
   try {
     other = await browser.newPage();
     await Promise.all([page.goto("/test/browser/index.html"), other.goto("http://127.0.0.1:5203/test/browser/index.html")]);
