@@ -1,0 +1,66 @@
+{
+  "name": "refstream.js",
+  "version": "0.1.0-alpha.1",
+  "description": "File references backed by URLs, Web Streams and peer-to-peer WebRTC streams.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/TeoSlayer/refstream.js#readme",
+  "bugs": {
+    "url": "https://github.com/TeoSlayer/refstream.js/issues"
+  },
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./browser/*": "./dist/browser/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TeoSlayer/refstream.js.git"
+  },
+  "keywords": [
+    "files",
+    "file-references",
+    "web-streams",
+    "webrtc",
+    "peer-to-peer",
+    "javascript",
+    "typescript"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "vitest run --config vitest.config.ts",
+    "test:package": "node scripts/test-package.mjs",
+    "prepack": "npm run build && npm test && npm run test:package",
+    "check": "npm run build && npm test && npm run test:package",
+    "pretest:browser": "npm run build",
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.11",
+    "@playwright/test": "^1.63.0"
+  }
+}
