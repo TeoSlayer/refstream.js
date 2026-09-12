@@ -55,6 +55,18 @@ describe("native browser renderer", () => {
     expect(terminal.buffer.active.viewportY).toBe(terminal.buffer.active.baseY);
   });
 
+  it("does not let a queued wheel scroll cancel explicit navigation before it paints", () => {
+    const { terminal, element, viewport } = open();
+    terminal.write(output(100)); paint();
+    viewport.scrollTop = 160; viewport.dispatchEvent(new Event("scroll")); paint();
+    terminal.scrollToBottom();
+    // Smooth wheel scrolling can queue another scroll between this call and rAF.
+    viewport.scrollTop = 144; viewport.dispatchEvent(new Event("scroll"));
+    paint();
+    expect(terminal.buffer.active.viewportY).toBe(terminal.buffer.active.baseY);
+    expect(element.querySelector(".shell-terminal-rows")!.textContent).toContain("line-99");
+  });
+
   it("keeps DOM reading order aligned with screen order after scrolling back", () => {
     const { terminal, element } = open();
     terminal.write(output(30)); paint(); terminal.scrollToLine(2); paint();

@@ -17,6 +17,7 @@
   position: absolute;
   inset: 0;
   overflow: auto;
+  scroll-behavior: auto;
   overscroll-behavior: contain;
   overflow-anchor: none;
   scrollbar-width: thin;

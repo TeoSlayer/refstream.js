@@ -19,7 +19,7 @@ export interface TerminalViewState {
 }
 
 /**
- * A virtualized DOM renderer over Shell's own VT state machine. Only visible
+ * A virtualized DOM renderer over Refstream's own VT state machine. Only visible
  * rows exist in the DOM; search, selection and export read the retained model.
  * Output is always assigned through textContent and never interpreted as HTML.
  */
@@ -40,6 +40,7 @@ export class NativeTerminal implements TerminalSurface {
   private viewportY = 0;
   private programmaticScrollTop = 0;
   private scrollDirty = true;
+  private navigationPending = false;
   private scrollRemainder = 0;
   private scrollMargin = 2;
   private scrollIdleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -237,7 +238,7 @@ export class NativeTerminal implements TerminalSurface {
   scrollToBottom(): void { this.scrollToLine(this.core.baseY); }
   scrollToLine(line: number): void {
     this.viewportY = Math.max(0, Math.min(this.core.baseY, Math.floor(line)));
-    this.scrollRemainder = 0; this.scrollDirty = true;
+    this.scrollRemainder = 0; this.scrollDirty = true; this.navigationPending = true;
     this.scheduleRender();
     this.scrollSignal.fire(this.viewportY);
   }
@@ -381,7 +382,11 @@ export class NativeTerminal implements TerminalSurface {
     // and explicit navigation set scrollTop, before the row mutations below.
     if (this.scrollDirty) {
       const top = Math.min(this.core.baseY * this.cellHeight, this.viewportY * this.cellHeight + this.scrollRemainder);
-      this.viewport.scrollTop = top; this.programmaticScrollTop = top; this.scrollDirty = false;
+      // Explicit navigation must interrupt native smooth scrolling as well as
+      // any scroll event queued before this frame (notably on WebKit/GTK).
+      if (this.navigationPending) this.viewport.scrollTo({ top, behavior: "instant" });
+      else this.viewport.scrollTop = top;
+      this.programmaticScrollTop = top; this.scrollDirty = false; this.navigationPending = false;
     }
     const first = Math.max(0, this.viewportY - this.scrollMargin);
     const end = Math.min(this.core.length, this.viewportY + this.rows + this.scrollMargin);
@@ -646,6 +651,7 @@ export class NativeTerminal implements TerminalSurface {
       if (this.modes.sendFocusMode) this.emitInput("\x1b[O", false);
     }, { signal });
     viewport.addEventListener("scroll", () => {
+      if (this.navigationPending) return;
       // Scroll events are queued. A paint from an earlier output batch must not
       // be mistaken for a user scrolling away from a newer, not-yet-painted tail.
       const top = viewport.scrollTop;
