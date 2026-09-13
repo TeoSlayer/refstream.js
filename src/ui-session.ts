@@ -1,4 +1,4 @@
-import { NativeTerminal, TerminalSession, terminalTranscript, replayRecording, type CommandRecord, type TerminalRecording } from "./index.js";
+import { NativeTerminal, TerminalSession, getTerminalSession, terminalTranscript, replayRecording, type CommandRecord, type TerminalRecording } from "./index.js";
 import { configureUi, ownUiCleanup, uiButton, uiText, uiTooltip, type TerminalUiOptions, type TerminalExploreTab, type TerminalUiContext } from "./ui-options.js";
 import { bindAgentInvitation } from "./ui-agent.js";
 
@@ -10,7 +10,7 @@ export function attachSessionTools(terminal: NativeTerminal, toolbar: HTMLElemen
   const entryMap = new Map(entries.map(entry => [entryId(entry), entry]));
   if (entryMap.size !== entries.length) throw new TypeError("Explore view IDs must be unique");
   if (suppliedSession && suppliedSession.terminal !== terminal) throw new TypeError("The session belongs to another terminal");
-  const session = suppliedSession ?? new TerminalSession(terminal);
+  const session = suppliedSession ?? getTerminalSession(terminal);
   if (!session.recording && (entries.includes("replay") || settings.render)) session.startRecording();
   const document = overlay.ownerDocument;
   const abort = new AbortController(); const signal = abort.signal;
@@ -21,8 +21,7 @@ export function attachSessionTools(terminal: NativeTerminal, toolbar: HTMLElemen
   const agentCaption = document.createElement("span"); agentCaption.textContent = agentButton.textContent; agentButton.replaceChildren(agentCaption);
   agentButton.hidden = !entryMap.has("agent") && !settings.render;
   agentButton.setAttribute("aria-expanded", "false");
-  const stopAgent = button("stopAgent", "Stop agent", "Disconnect the agent from this terminal"); stopAgent.hidden = true;
-  stopAgent.textContent = "×";
+  const stopAgent = button("stopAgent", "Revoke access", "Revoke the agent’s access to this terminal"); stopAgent.hidden = true;
   const backdrop = document.createElement("div"); backdrop.className = "terminal-agent-backdrop"; backdrop.hidden = true; backdrop.setAttribute("aria-hidden", "true");
   const compact = document.defaultView?.matchMedia("(max-width: 760px)");
   const panel = document.createElement("section"); panel.className = "terminal-explorer"; panel.hidden = true; configureUi(panel, ui);
@@ -43,7 +42,9 @@ export function attachSessionTools(terminal: NativeTerminal, toolbar: HTMLElemen
           <p class="terminal-explorer-note" data-ui-text="agentRequirements">Your agent needs a command tool and Node.js 22 or newer. The invitation includes everything it needs to connect.</p>
         </details>
         <div class="terminal-pair-request"><button type="button" data-copy-invitation data-ui-text="copyInvitation">Copy invitation</button><span data-copy-status role="status"></span><textarea data-agent-message readonly hidden data-ui-aria="invitationMessage" aria-label="Message for your agent"></textarea></div>
-        <div class="terminal-agent-connection"><div><p role="status" data-agent-status data-ui-text="agentDisconnected">No agent connected.</p><small data-agent-expiry hidden aria-live="off"></small></div><button type="button" data-panel-stop data-ui-text="stopAgent" hidden>Stop agent</button></div>
+        <div class="terminal-agent-connection"><div><p role="status" data-agent-status data-ui-text="agentDisconnected">No agent connected.</p><small data-agent-expiry hidden aria-live="off"></small></div><button type="button" data-panel-stop data-ui-text="stopAgent" hidden>Revoke access</button></div>
+        <div data-agent-input-guard hidden><p class="terminal-explorer-note" data-agent-input-note role="status"></p><button type="button" data-agent-input-allow data-ui-text="agentInputCleared">I've cleared my draft</button></div>
+        <div class="terminal-agent-task" data-agent-task hidden><p role="status" data-task-status></p><p class="terminal-explorer-note" data-task-note></p><details data-task-result hidden><summary data-task-result-label></summary><pre data-task-result-text></pre></details></div>
         <p class="terminal-explorer-note terminal-agent-privacy" data-ui-text="agentPrivacy">Only this terminal is shared. You can revoke access at any time.</p>
       </div>
     </div>`;
@@ -242,6 +243,6 @@ export function attachSessionTools(terminal: NativeTerminal, toolbar: HTMLElemen
     abort.abort(); clearTimeout(timer); closeReplay(); closeCustom(); change.dispose();
     for (const lifetime of cardLifetimes.splice(0)) lifetime.abort();
     for (const [url, timer] of downloads) { clearTimeout(timer); URL.revokeObjectURL(url); } downloads.clear();
-    if (!suppliedSession) session.dispose(); explore.remove(); agentButton.remove(); stopAgent.remove(); backdrop.remove(); panel.remove();
+    explore.remove(); agentButton.remove(); stopAgent.remove(); backdrop.remove(); panel.remove();
   } };
 }

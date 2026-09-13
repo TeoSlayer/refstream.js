@@ -112,12 +112,27 @@ const commands = session.read().commands;
 // session.dispose() when the session ends.
 ```
 
-Snapshots retain the parser state, buffers, cursor, modes and command records.
+Snapshots retain the parser state, buffers, cursor, modes, command records and
+agent handoffs, including their retained answers and logical session identity.
 They contain terminal output and should be protected like the underlying session.
 `TerminalRecorder` and `replayRecording` record and replay output and resize events.
 The optional Bash/Zsh scripts in `shell-integration/` emit OSC 133 command markers
 for exit status and command timing; arbitrary plain output cannot supply reliable
 command boundaries on its own.
+
+## Agent handoffs
+
+The optional Agent panel creates a private invitation an agent can use with its
+ordinary command tool. A connection can be reused across requests. Handoffs have
+stable task IDs, draft protection, bounded waits and retained results. Collecting
+an answer leaves the connection open; stopping the connector refuses to abandon
+uncollected work. The browser owner can revoke access immediately.
+
+Completion comes from shell markers, a host callback, or an explicitly labelled
+observation by the visiting agent. Quiet output alone is never completion.
+See [persistent sessions and agent APIs](docs/agents.md) for usage, host hooks,
+retention limits and the distinction between terminal state and a live backend
+process.
 
 ## Optional interface
 

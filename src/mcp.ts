@@ -26,6 +26,7 @@ export function validateTerminalAgentPairing(pairingUrl: string, origin: string,
 
 /** The narrow command boundary; transport messages never evaluate page JavaScript. */
 export async function handleTerminalAgentRequest(session: TerminalSession, request: TerminalAgentRequest, permission: "read" | "control", signal?: AbortSignal): Promise<unknown> {
+  if (session.signal.aborted || signal?.aborted) throw new Error("Terminal access has ended");
   if (!request || typeof request !== "object" || typeof request.method !== "string" || (request.args !== undefined && (!request.args || typeof request.args !== "object" || Array.isArray(request.args)))) throw new TypeError("Invalid terminal request");
   const args = request.args ?? {};
   const text = (key: string, max = 8192) => {
@@ -37,20 +38,34 @@ export async function handleTerminalAgentRequest(session: TerminalSession, reque
     if (!Number.isSafeInteger(value) || (value as number) < 0) throw new TypeError(`Invalid ${key}`);
     return value as number;
   };
-  if (["send_text", "send_key", "execute"].includes(request.method) && permission !== "control") throw new Error("This session grants read access only");
+  const expected = () => {
+    const value = number("expectedSequence");
+    if (value === undefined) throw new TypeError(`${request.method} requires expectedSequence from a recent read`);
+    return value;
+  };
+  if (["send_text", "send_key", "execute", "ask", "collect_task", "cancel_task"].includes(request.method) && permission !== "control") throw new Error("This session grants read access only");
   switch (request.method) {
     case "read": return session.read({ startRow: number("startRow"), maxRows: number("maxRows", 100) });
     case "search": return session.search(text("query", 512), args.caseSensitive === true).slice(0, 100);
     case "commands": return session.commands.list().slice(-100).map(({ output: _output, ...record }) => record);
     case "command_output": return session.commands.output(number("commandId", 0)!);
     case "wait": return session.wait(number("afterSequence", session.sequence)!, Math.min(number("timeoutMs", 15_000)!, 30_000), signal);
-    case "send_text": return session.sendText(text("text"), text("inputId", 128), number("expectedSequence"));
-    case "send_key": return session.sendKey({ key: text("key", 32), ctrlKey: args.ctrl === true, altKey: args.alt === true, shiftKey: args.shift === true }, text("inputId", 128), number("expectedSequence"));
-    case "execute": {
-      const expected = number("expectedSequence");
-      if (expected === undefined) throw new TypeError("execute requires expectedSequence from a recent read");
-      return session.execute(text("command"), text("inputId", 128), expected);
+    case "tasks": return { terminalSessionId: session.id, tasks: session.tasks.summary() };
+    case "ask": {
+      if (args.kind !== undefined && args.kind !== "command" && args.kind !== "message") throw new TypeError("Choose command or message");
+      return session.ask(text("prompt"), text("taskId", 128), expected(), { kind: args.kind, confirmEmptyInput: args.confirmEmptyInput === true });
     }
+    case "read_task": return session.readTask(text("taskId", 128));
+    case "wait_task": return session.waitTask(text("taskId", 128), number("afterRevision", 0)!, Math.min(number("timeoutMs", 15_000)!, 30_000), signal);
+    case "collect_task": {
+      if (args.completion !== undefined && args.completion !== "agent_observed") throw new TypeError("Only the host or shell may report their own completion events");
+      return session.collectTask(text("taskId", 128), { expectedSequence: number("expectedSequence"), answer: args.answer === undefined ? undefined : text("answer", 32768), completion: args.completion });
+    }
+    case "cancel_task": return session.cancelTask(text("taskId", 128), text("reason", 1024));
+    case "can_disconnect": session.assertCanDisconnect(); return { allowed: true };
+    case "send_text": return session.sendText(text("text"), text("inputId", 128), expected(), args.confirmEmptyInput === true);
+    case "send_key": return session.sendKey({ key: text("key", 32), ctrlKey: args.ctrl === true, altKey: args.alt === true, shiftKey: args.shift === true }, text("inputId", 128), expected());
+    case "execute": return session.execute(text("command"), text("inputId", 128), expected());
     default: throw new Error("Unsupported terminal operation");
   }
 }
@@ -61,6 +76,7 @@ export async function handleTerminalAgentRequest(session: TerminalSession, reque
  * Only the exact popup, origin and one-time token can reach this session.
  */
 export function connectTerminalAgent(session: TerminalSession, options: TerminalAgentOptions): Disposable {
+  if (session.signal.aborted) throw new Error("Terminal access has ended");
   const view = session.terminal.element?.ownerDocument.defaultView;
   if (!view) throw new Error("Open the terminal in a browser before connecting an agent");
   if (!["read", "control"].includes(options.permission)) throw new TypeError("Choose read or control access");
@@ -99,20 +115,26 @@ export function connectTerminalAgent(session: TerminalSession, options: Terminal
     }
   };
   view.addEventListener("message", receive);
-  options.onStatus?.("connecting");
   const timer = setInterval(() => { if (popup.closed) dispose(); }, 500);
   const timeout = setTimeout(() => { if (!connected) dispose("Pairing timed out. Create a fresh pairing URL and try again."); }, 30_000);
+  const ended = () => dispose("Terminal session ended.");
+  session.signal.addEventListener("abort", ended, { once: true });
+  options.onStatus?.("connecting");
   function dispose(detail?: string) {
     if (disposed) return;
     disposed = true; abort.abort(); clearInterval(timer); clearTimeout(timeout);
+    session.signal.removeEventListener("abort", ended);
     view!.removeEventListener("message", receive); popup!.close(); options.onStatus?.("disconnected", detail);
   }
   return { dispose };
 }
 
 export function connectRemoteAgent(session: TerminalSession, options: TerminalAgentOptions, pair: TerminalRelayPairing, connectionOptions: { onAuthenticated?: () => void; pairingTimeoutMs?: number } = {}): Disposable {
+  if (session.signal.aborted) throw new Error("Terminal access has ended");
+  if (!["read", "control"].includes(options.permission)) throw new TypeError("Choose read or control access");
   const abort = new AbortController(); let pending = 0, connected = false;
   let handshake: ReturnType<typeof setTimeout> | undefined;
+  const ended = () => connection.dispose();
   const connection = connectTerminalRelay({
     ...pair, ...connectionOptions, role: "browser",
     onPaired(channel) {
@@ -133,9 +155,10 @@ export function connectRemoteAgent(session: TerminalSession, options: TerminalAg
         error => { if (!abort.signal.aborted) return channel.send({ type: "response", id: message.id, error: error instanceof Error ? error.message : "Terminal request failed" }); },
       ).catch(() => {}).finally(() => { pending--; });
     },
-    onClose(detail) { clearTimeout(handshake); abort.abort(); options.onStatus?.("disconnected", detail); },
+    onClose(detail) { clearTimeout(handshake); abort.abort(); session.signal.removeEventListener("abort", ended); options.onStatus?.("disconnected", detail); },
   });
   handshake = setTimeout(() => { connection.dispose(); }, (connectionOptions.pairingTimeoutMs ?? 125_000) + 5000);
+  session.signal.addEventListener("abort", ended, { once: true });
   options.onStatus?.("connecting");
   return { dispose() { connection.dispose(); } };
 }

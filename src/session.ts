@@ -7,16 +7,29 @@ import { Signal, type Disposable } from "./types.js";
 import type { NativeTerminal, TerminalViewState } from "./native.js";
 import { encodeTerminalKey, type TerminalKey } from "./input.js";
 import { validateState } from "./state.js";
+import { TerminalTasks, validateTaskId, type TerminalTask, type TerminalTaskResult } from "./tasks.js";
 
 export interface InputReceipt { inputId: string; sequence: number; status: "sent"; commandId?: number }
 export interface SessionSnapshot {
   version: 1; sequence: number; terminal: TerminalViewState; commands: CommandRecord[];
   executionPending?: boolean;
+  sessionId?: string;
+  tasks?: TerminalTask[];
+  retiredTaskIds?: string[];
+  input?: { revision: number; owner: "none" | "local" | "agent" | "unknown" };
+}
+export interface TerminalAskOptions { kind?: "command" | "message"; confirmEmptyInput?: boolean }
+let sessionCounter = 0;
+function sessionIdentity(): string {
+  // Identity is metadata, never an authorization credential. The fallback also
+  // permits headless use in older Node environments without global Web Crypto.
+  return globalThis.crypto?.randomUUID?.() ?? `session-${Date.now().toString(36)}-${++sessionCounter}`;
 }
 
 /** A stable live-session API shared by command UI, replay and optional agent adapters. */
 export class TerminalSession implements Disposable {
   readonly commands: CommandTracker;
+  readonly tasks = new TerminalTasks();
   readonly onChange: (listener: (sequence: number) => void) => Disposable;
   private change = new Signal<number>();
   private subscriptions: Disposable[];
@@ -24,18 +37,57 @@ export class TerminalSession implements Disposable {
   private sequenceValue = 0;
   private disposed = false;
   private executionPending = false;
+  private sessionId = sessionIdentity();
+  private inputRevision = 0;
+  private inputOwner: "none" | "local" | "agent" | "unknown" = "unknown";
+  private hostInputEmpty = false;
+  private inputSource = Symbol("session input");
+  private lifetime = new AbortController();
+  /** End of the logical session, independent of a toolbar or agent connection. */
+  readonly signal = this.lifetime.signal;
   private recorder?: TerminalRecorder;
   constructor(readonly terminal: NativeTerminal) {
+    if (terminal.signal.aborted) throw new Error("Terminal has ended");
     this.commands = new CommandTracker(terminal.core);
     this.onChange = this.change.event;
     const changed = () => this.change.fire(++this.sequenceValue);
     this.subscriptions = [terminal.core.activity.event(event => {
-      if (event.type === "reset" || event.type === "restore") this.executionPending = false;
+      if (event.type === "reset" || event.type === "restore") {
+        this.executionPending = false; this.inputOwner = "unknown"; this.hostInputEmpty = false; this.inputRevision++;
+        this.tasks.attention("Terminal state changed. Inspect it before continuing the handoff.");
+      }
+      if (event.type === "write") {
+        this.hostInputEmpty = false;
+        this.tasks.output();
+        for (const task of this.tasks.summary()) if (task.kind === "command" && task.commandId !== undefined && ["waiting", "needs_attention"].includes(task.status)) {
+          const command = this.commands.get(task.commandId);
+          if (command?.status === "completed") {
+            const output = this.commands.output(task.commandId);
+            this.tasks.complete(task.id, { text: output.text, truncated: output.truncated, sequence: this.sequence + 1, completion: "shell", exitCode: command.exitCode });
+          } else if (command?.status === "unknown") this.tasks.attention("The shell returned without an explicit completion status. Inspect the result.");
+        }
+      }
       changed();
     }), terminal.core.command.event(marker => {
       if (marker.kind === "output" || marker.kind === "finished" || marker.kind === "prompt") this.executionPending = false;
-    }), terminal.onData(changed), terminal.onBinary(changed)];
+      if (marker.kind === "command") this.inputOwner = "none";
+    }), terminal.onInput(event => {
+      this.hostInputEmpty = false;
+      if (event.source !== this.inputSource) {
+        this.inputRevision++;
+        // Enter may submit or insert a newline in an application. It leaves an
+        // unverified composer, never a claimed-empty one.
+        this.inputOwner = event.data === "\r" || event.data === "\r\n" || event.data === "\x03" ? "unknown" : "local";
+        this.tasks.attention("Someone else used the terminal. Inspect their input and the task before continuing.");
+      }
+      changed();
+    }), this.tasks.onChange(changed)];
+    const ended = () => this.dispose();
+    terminal.signal.addEventListener("abort", ended, { once: true });
+    this.subscriptions.push({ dispose: () => terminal.signal.removeEventListener("abort", ended) });
   }
+  get id(): string { return this.sessionId; }
+  get input() { return this.inputState(); }
   get sequence(): number { return this.sequenceValue; }
   get recording(): TerminalRecorder | undefined { return this.recorder; }
   startRecording(maxBytes?: number): TerminalRecorder {
@@ -54,38 +106,169 @@ export class TerminalSession implements Disposable {
       viewportY: this.terminal.buffer.active.viewportY, selection: this.terminal.getSelection(),
       startRow: start, totalRows: core.length, droppedRows: core.history.dropped, lines,
       inputEnabled: !this.terminal.options.disableStdin, atPrompt: this.commands.atPrompt && !this.executionPending, executionPending: this.executionPending,
+      terminalSessionId: this.id, input: this.inputState(), tasks: this.tasks.summary(),
       commands: this.commands.list().slice(-50).map(({ output: _output, ...record }) => record),
     };
   }
   search(query: string, caseSensitive = false) { return findInTerminal(this.terminal.buffer.active, this.terminal.cols, query, caseSensitive); }
-  snapshot(): SessionSnapshot { return { version: 1, sequence: this.sequence, terminal: this.terminal.serialize(), commands: this.commands.serialize(), executionPending: this.executionPending }; }
+  snapshot(): SessionSnapshot { return { version: 1, sequence: this.sequence, sessionId: this.id, terminal: this.terminal.serialize(), commands: this.commands.serialize(), executionPending: this.executionPending, tasks: this.tasks.serialize(), retiredTaskIds: this.tasks.retired(), input: { revision: this.inputRevision, owner: this.inputOwner } }; }
   restore(snapshot: SessionSnapshot): void {
     if (!snapshot || snapshot.version !== 1 || !Number.isSafeInteger(snapshot.sequence) || snapshot.sequence < 0) throw new TypeError("Invalid session snapshot");
     if (snapshot.executionPending !== undefined && typeof snapshot.executionPending !== "boolean") throw new TypeError("Invalid pending execution state");
+    if (snapshot.sessionId !== undefined) validateTaskId(snapshot.sessionId);
+    if (snapshot.input !== undefined && (!snapshot.input || !Number.isSafeInteger(snapshot.input.revision) || snapshot.input.revision < 0 || !["none", "local", "agent", "unknown"].includes(snapshot.input.owner))) throw new TypeError("Invalid input state");
+    const tasks = TerminalTasks.validate(snapshot.tasks ?? []);
+    const retired = TerminalTasks.validateRetired(snapshot.retiredTaskIds ?? [], tasks);
     validateState(snapshot.terminal?.model);
     const validation = new CommandTracker(new TerminalCore());
     try { validation.restore(snapshot.commands); } finally { validation.dispose(); }
     this.terminal.restore(snapshot.terminal); this.commands.restore(snapshot.commands);
     this.executionPending = snapshot.executionPending ?? false;
+    this.sessionId = snapshot.sessionId ?? this.sessionId; this.tasks.restore(tasks, retired);
+    this.inputRevision = Math.max(this.inputRevision, snapshot.input?.revision ?? 0) + 1;
+    // A saved ownership flag cannot authorize Enter in a newly attached process.
+    this.inputOwner = snapshot.input?.owner === "local" || snapshot.input?.owner === "agent" ? "local" : "unknown";
+    this.receipts.clear();
     this.sequenceValue = Math.max(this.sequenceValue, snapshot.sequence) + 1; this.change.fire(this.sequenceValue);
   }
-  sendText(text: string, inputId: string, expectedSequence?: number): InputReceipt {
+  sendText(text: string, inputId: string, expectedSequence?: number, confirmEmptyInput = false): InputReceipt {
     if (typeof text !== "string" || !text.replace(/\x1b/gu, "")) throw new TypeError("Input text is empty");
-    return this.send(inputId, JSON.stringify(["text", text]), expectedSequence, () => this.terminal.paste(text));
+    return this.send(inputId, JSON.stringify(["text", text]), expectedSequence, () => {
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/u.test(text)) throw new TypeError("sendText accepts plain text; use sendKey for control keys");
+      this.assertInputAvailable(confirmEmptyInput, true);
+      if (/[\r\n\t]/u.test(text) && !this.terminal.core.modes.bracketedPasteMode) throw new Error("Multiline input requires bracketed paste; nothing was sent");
+      this.inputOwner = "agent"; this.terminal.paste(text, this.inputSource);
+    });
   }
   sendKey(key: TerminalKey, inputId: string, expectedSequence?: number): InputReceipt {
-    if (!encodeTerminalKey(key, this.terminal.core.modes)) throw new TypeError("This key cannot be sent to the terminal");
-    return this.send(inputId, JSON.stringify(["key", key]), expectedSequence, () => this.terminal.sendKey(key));
+    const encoded = encodeTerminalKey(key, this.terminal.core.modes);
+    if (!encoded) throw new TypeError("This key cannot be sent to the terminal");
+    return this.send(inputId, JSON.stringify(["key", key]), expectedSequence, () => {
+      if (this.terminal.inputComposing || this.inputOwner === "local") throw new Error("Someone else's draft is present; nothing was sent. Leave their input unchanged.");
+      if ((/[\r\n]/u.test(encoded) || key.key === "Enter") && this.inputOwner !== "agent") throw new Error("No agent-owned draft to submit. Use ask to submit a new message atomically.");
+      if (/[\r\n]/u.test(encoded) || key.key === "Enter") this.inputOwner = "unknown";
+      else if (encoded.length === 1 && encoded >= " " && encoded !== "\x7f") {
+        this.assertInputAvailable(false, true); this.inputOwner = "agent";
+      }
+      this.terminal.sendKey(key, this.inputSource);
+    });
   }
   execute(command: string, inputId: string, expectedSequence?: number): InputReceipt {
     return this.send(inputId, JSON.stringify(["execute", command]), expectedSequence, () => {
       if (!command || /[\x00-\x1f\x7f]/u.test(command)) throw new TypeError("execute accepts one command line; use sendText for interactive or multiline input");
       if (this.executionPending) throw new Error("Previous input is awaiting a shell boundary; inspect state or wait before executing another command");
-      if (!this.commands.atPrompt || this.commands.inputText) throw new Error("No empty, explicitly marked shell prompt. Use sendText/sendKey to interact with the current application.");
+      if (!this.commands.atPrompt || this.inputState().state !== "empty") throw new Error("No empty, explicitly marked shell prompt. Existing input was left unchanged.");
       this.executionPending = true;
-      this.terminal.paste(command); this.terminal.sendKey({ key: "Enter" });
+      const revision = this.inputRevision;
+      this.inputOwner = "agent"; this.terminal.paste(command, this.inputSource);
+      if (revision !== this.inputRevision || this.terminal.inputComposing) throw new Error("Input changed before submission. Inspect the terminal before retrying.");
+      this.inputOwner = "unknown"; this.terminal.sendKey({ key: "Enter" }, this.inputSource);
     }, this.commands.active?.id);
   }
+  /** Submit once and retain the handoff independently of the connection that sent it. */
+  ask(prompt: string, taskId: string, expectedSequence: number, options: TerminalAskOptions = {}): TerminalTask {
+    this.assertLive(true); validateTaskId(taskId);
+    const kind = options.kind ?? "message";
+    if (!["command", "message"].includes(kind) || typeof prompt !== "string" || !prompt.trim() || prompt.length > 8192 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/u.test(prompt)) throw new TypeError("Use a plain-text prompt of at most 8192 characters");
+    const previous = this.tasks.find(taskId);
+    if (previous) {
+      if (previous.prompt !== prompt || previous.kind !== kind) throw new Error("Task ID was already used for a different request");
+      return previous;
+    }
+    this.assertSequence(expectedSequence);
+    if (this.tasks.pending.length) throw new Error("Collect the previous answer before starting another task. Keep this session connected.");
+    if (this.executionPending) throw new Error("Previous input is awaiting a shell boundary. Nothing was sent.");
+    if (kind === "command") {
+      if (!this.commands.atPrompt || this.inputState().state !== "empty" || /[\r\n\t]/u.test(prompt)) throw new Error("A command needs an empty marked shell prompt and one line; nothing was sent");
+    } else {
+      if (this.commands.atPrompt) throw new Error("This is a shell prompt. Use kind: command for a shell command, or open the intended application first.");
+      this.assertInputAvailable(options.confirmEmptyInput === true);
+      if (/[\r\n\t]/u.test(prompt) && !this.terminal.core.modes.bracketedPasteMode) throw new Error("Multiline messages require bracketed paste; nothing was sent");
+    }
+    const revision = this.inputRevision;
+    this.tasks.begin({ id: taskId, prompt, kind, submittedSequence: this.sequence, ...(kind === "command" ? { commandId: this.commands.active?.id } : {}) });
+    // The task exists before either input event, so even immediate shell output
+    // has somewhere to report completion. Never roll back and retry input.
+    try {
+      if (revision !== this.inputRevision || this.terminal.inputComposing) throw new Error("Input changed before submission; nothing was sent.");
+      if (kind === "command") this.executionPending = true;
+      this.inputOwner = "agent";
+      this.terminal.paste(prompt, this.inputSource);
+      if (revision !== this.inputRevision || this.terminal.inputComposing) throw new Error("Input changed before submission. The task needs inspection; do not retry it with a new ID.");
+      this.inputOwner = "unknown"; this.terminal.sendKey({ key: "Enter" }, this.inputSource);
+    } catch (error) { this.tasks.attention("Submission was interrupted. Inspect the terminal before retrying; delivery may be partial."); throw error; }
+    return this.tasks.get(taskId);
+  }
+  readTask(taskId: string) { return { task: this.tasks.get(taskId), terminal: this.read(), next: this.taskNext(taskId) }; }
+  async waitTask(taskId: string, afterRevision: number, timeoutMs = 15_000, signal?: AbortSignal) {
+    const task = this.tasks.get(taskId);
+    if (!Number.isSafeInteger(afterRevision) || afterRevision < 0 || afterRevision > task.revision) throw new RangeError("Revision does not belong to this task");
+    if (this.disposed || signal?.aborted) throw new Error("Session wait cancelled");
+    const settled = (task: TerminalTask) => ["completed", "collected", "cancelled"].includes(task.status);
+    if (task.revision > afterRevision || settled(task)) return { ...this.readTask(taskId), timedOut: false };
+    const deadline = Date.now() + Math.max(1, Math.min(30_000, timeoutMs));
+    for (;;) {
+      const waited = await this.wait(this.sequence, Math.max(1, deadline - Date.now()), signal);
+      const current = this.tasks.get(taskId);
+      if (waited.timedOut || current.revision > afterRevision || settled(current) || Date.now() >= deadline) return { ...this.readTask(taskId), timedOut: waited.timedOut || Date.now() >= deadline };
+    }
+  }
+  /** A trusted host adapter can supply actual application completion, without screen guessing. */
+  completeTask(taskId: string, answer: string, options: { truncated?: boolean } = {}): TerminalTask {
+    this.assertLive();
+    return this.tasks.complete(taskId, { text: answer, truncated: options.truncated === true, sequence: this.sequence, completion: "host" });
+  }
+  /** Host-only composer acknowledgement. Call after the application reports its input is empty. */
+  confirmInputEmpty(expectedRevision: number): void {
+    this.assertLive(true);
+    if (expectedRevision !== this.inputRevision || this.terminal.inputComposing || this.commands.atPrompt && Boolean(this.commands.inputText)) throw new Error("Input changed; inspect the application's composer again");
+    this.inputOwner = "none"; this.hostInputEmpty = true; this.change.fire(++this.sequenceValue);
+  }
+  collectTask(taskId: string, options: { expectedSequence?: number; answer?: string; completion?: "agent_observed" } = {}) {
+    this.assertLive();
+    const task = this.tasks.get(taskId);
+    if (task.status === "collected" || task.status === "cancelled") return this.readTask(taskId);
+    if (task.status === "completed") this.tasks.collect(taskId);
+    else {
+      this.assertSequence(options.expectedSequence);
+      const result: TerminalTaskResult = {
+        text: options.answer ?? this.read({ maxRows: 100 }).lines.join("\n").slice(0, 32768),
+        truncated: options.answer === undefined, sequence: this.sequence,
+      };
+      if (options.completion === "agent_observed") {
+        if (!options.answer?.trim()) throw new Error("Include the actual answer before confirming observed completion. A quiet screen is not completion.");
+        this.tasks.complete(taskId, { ...result, completion: "agent_observed" }); this.tasks.collect(taskId);
+      } else this.tasks.collect(taskId, result);
+    }
+    return this.readTask(taskId);
+  }
+  cancelTask(taskId: string, reason: string): TerminalTask {
+    this.assertLive();
+    if (typeof reason !== "string" || !reason.trim() || reason.length > 1024) throw new TypeError("Give a brief reason for abandoning the task");
+    return this.tasks.cancel(taskId, reason);
+  }
+  assertCanDisconnect(): void {
+    const pending = this.tasks.pending;
+    if (pending.length) throw new Error(`Task ${pending[0].id} still needs an answer or collection. Keep the session connected, collect the answer, or explicitly abandon the task before stopping.`);
+  }
+  private taskNext(taskId: string): "wait" | "inspect" | "collect" | "done" {
+    const status = this.tasks.get(taskId).status;
+    return status === "waiting" ? "wait" : status === "needs_attention" ? "inspect" : status === "completed" ? "collect" : "done";
+  }
+  private inputState() {
+    const state = this.terminal.inputComposing || this.inputOwner === "local" || this.inputOwner === "agent" || this.commands.atPrompt && Boolean(this.commands.inputText)
+      ? "occupied" : !this.executionPending && (this.hostInputEmpty || this.commands.atPrompt && this.inputOwner === "none") ? "empty" : "unknown";
+    return { state, owner: this.inputOwner, revision: this.inputRevision, composing: this.terminal.inputComposing, verifiedBy: state === "empty" ? this.hostInputEmpty ? "host" : "shell" : null };
+  }
+  private assertInputAvailable(confirmEmpty: boolean, append = false): void {
+    const input = this.inputState();
+    if (input.composing || input.owner === "local" || input.state === "occupied" && !(append && input.owner === "agent")) throw new Error("Someone else's draft may be present; nothing was sent. Leave existing input unchanged.");
+    if (input.state === "unknown" && !confirmEmpty) throw new Error("This application does not report an empty composer. Inspect it, then use confirmEmptyInput only if you verified it is empty. Nothing was sent.");
+  }
+  private assertSequence(expected: number | undefined): void {
+    if (expected === undefined || expected !== this.sequence) throw new Error("Terminal state changed or no recent sequence was supplied; read it again before sending input");
+  }
+  private assertLive(input = false): void { if (this.disposed || input && this.terminal.options.disableStdin) throw new Error("Terminal input is unavailable"); }
   wait(after: number, timeoutMs = 15_000, signal?: AbortSignal): Promise<{ sequence: number; timedOut: boolean }> {
     if (!Number.isSafeInteger(after) || after < 0 || after > this.sequence) return Promise.reject(new RangeError("Sequence does not belong to the current session"));
     if (this.disposed || signal?.aborted) return Promise.reject(new Error("Session wait cancelled"));
@@ -104,9 +287,10 @@ export class TerminalSession implements Disposable {
     });
   }
   dispose(): void {
-    this.disposed = true; this.change.fire(this.sequence);
+    if (this.disposed) return;
+    this.disposed = true; this.lifetime.abort(); this.change.fire(this.sequence);
     for (const subscription of this.subscriptions) subscription.dispose();
-    this.commands.dispose(); this.recorder?.dispose(); this.change.dispose(); this.receipts.clear();
+    this.commands.dispose(); this.tasks.dispose(); this.recorder?.dispose(); this.change.dispose(); this.receipts.clear();
   }
   private send(id: string, signature: string, expected: number | undefined, action: () => void, commandId?: number): InputReceipt {
     if (this.disposed || this.terminal.options.disableStdin) throw new Error("Terminal input is unavailable");
@@ -123,4 +307,12 @@ export class TerminalSession implements Disposable {
     if (this.receipts.size > 128) this.receipts.delete(this.receipts.keys().next().value!);
     return { ...receipt };
   }
+}
+
+const sessions = new WeakMap<NativeTerminal, TerminalSession>();
+/** The default session used by optional UI. It survives UI remounts until the terminal ends. */
+export function getTerminalSession(terminal: NativeTerminal): TerminalSession {
+  let session = sessions.get(terminal);
+  if (!session || session.signal.aborted) { session = new TerminalSession(terminal); sessions.set(terminal, session); }
+  return session;
 }

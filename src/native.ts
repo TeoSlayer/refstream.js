@@ -78,12 +78,18 @@ export class NativeTerminal implements TerminalSurface {
   private styleRevision = 0;
   private theme: TerminalTheme = {};
   private dataSignal = new Signal<string>();
+  private inputSignal = new Signal<{ type: "input" | "composition" | "mouse"; data?: string; source?: unknown }>();
   private binarySignal = new Signal<string>();
   private scrollSignal = new Signal<number>();
   private renderSignal = new Signal<{ start: number; end: number }>();
   private resizeSignal = new Signal<TerminalSize>();
 
   readonly onData = this.dataSignal.event;
+  /** Input activity before transport delivery. Terminal protocol replies are excluded. */
+  readonly onInput = this.inputSignal.event;
+  /** Terminal lifetime; UI mounts have their own, shorter lifetimes. */
+  readonly signal = this.abort.signal;
+  get inputComposing(): boolean { return this.composing; }
   readonly onBinary = this.binarySignal.event;
   readonly onScroll = this.scrollSignal.event;
   readonly onRender = this.renderSignal.event;
@@ -232,8 +238,8 @@ export class NativeTerminal implements TerminalSurface {
   focus(): void { this.textarea?.focus({ preventScroll: true }); }
   blur(): void { this.textarea?.blur(); }
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void { this.keyHandler = handler; }
-  paste(text: string): void { this.emitInput(encodeTerminalPaste(text, this.modes.bracketedPasteMode)); }
-  sendKey(key: TerminalKey): void { const data = encodeTerminalKey(key, this.modes); if (data !== null) this.emitInput(data); }
+  paste(text: string, source?: unknown): void { this.emitInput(encodeTerminalPaste(text, this.modes.bracketedPasteMode), true, source); }
+  sendKey(key: TerminalKey, source?: unknown): void { const data = encodeTerminalKey(key, this.modes); if (data !== null) this.emitInput(data, true, source); }
   scrollLines(count: number): void { this.scrollToLine(this.viewportY + count); }
   scrollToBottom(): void { this.scrollToLine(this.core.baseY); }
   scrollToLine(line: number): void {
@@ -285,7 +291,7 @@ export class NativeTerminal implements TerminalSurface {
     clearTimeout(this.scrollIdleTimer);
     this.core.changed.dispose(); this.core.reply.dispose(); this.core.titleChanged.dispose(); this.core.command.dispose(); this.core.bell.dispose();
     this.core.activity.dispose();
-    this.dataSignal.dispose(); this.binarySignal.dispose(); this.scrollSignal.dispose(); this.renderSignal.dispose();
+    this.dataSignal.dispose(); this.inputSignal.dispose(); this.binarySignal.dispose(); this.scrollSignal.dispose(); this.renderSignal.dispose();
     this.resizeSignal.dispose();
     this.rowNodes.clear(); this.rowPool = [];
     this.element?.remove();
@@ -612,7 +618,10 @@ export class NativeTerminal implements TerminalSurface {
       const data = encodeTerminalKey(event, this.modes);
       if (data !== null) { event.preventDefault(); this.emitInput(data); textarea.value = ""; }
     }, { signal });
-    textarea.addEventListener("compositionstart", () => { this.composing = true; this.compositionCommit = ""; }, { signal });
+    textarea.addEventListener("compositionstart", () => {
+      this.composing = true; this.compositionCommit = "";
+      this.inputSignal.fire({ type: "composition" });
+    }, { signal });
     textarea.addEventListener("compositionend", (event) => {
       this.composing = false;
       this.compositionCommit = event.data;
@@ -754,9 +763,10 @@ export class NativeTerminal implements TerminalSurface {
     }, { signal });
   }
 
-  private emitInput(data: string, user = true): void {
+  private emitInput(data: string, user = true, source?: unknown): void {
     if (this.disposed || this.options.disableStdin || !data) return;
     if (user) {
+      this.inputSignal.fire({ type: "input", data, source });
       this.clearSelection();
       if (this.options.scrollOnUserInput !== false) this.scrollToBottom();
     }
@@ -794,6 +804,9 @@ export class NativeTerminal implements TerminalSurface {
     if (this.options.disableStdin || this.modes.mouseTrackingMode === "none") return;
     const { row, column } = this.position(event.clientX, event.clientY);
     const encoded = encodeTerminalMouse({ kind, button, x: column + 1, y: row - this.core.baseY + 1, shift: event.shiftKey, alt: event.altKey, ctrl: event.ctrlKey }, this.modes);
-    if (encoded) (encoded.binary ? this.binarySignal : this.dataSignal).fire(encoded.data);
+    if (encoded) {
+      this.inputSignal.fire({ type: "mouse" });
+      (encoded.binary ? this.binarySignal : this.dataSignal).fire(encoded.data);
+    }
   }
 }
