@@ -8,7 +8,7 @@ import type { NativeTerminal, TerminalViewState } from "./native.js";
 import { encodeTerminalKey, type TerminalKey } from "./input.js";
 import { validateState } from "./state.js";
 import { TerminalTasks, validateTaskId, type TerminalTask, type TerminalTaskResult } from "./tasks.js";
-import { inspectCursorLine, validateApplicationReport, type TerminalApplicationReport, type TerminalApplicationState, type TerminalComposerContent, type TerminalInputState } from "./application.js";
+import { inspectCursorLine, validateApplicationReport, type TerminalApplicationReport, type TerminalApplicationState, type TerminalApplicationObservation, type TerminalComposerContent, type TerminalInputState } from "./application.js";
 
 export interface InputReceipt { inputId: string; sequence: number; status: "sent"; commandId?: number }
 export interface SessionSnapshot {
@@ -20,6 +20,14 @@ export interface SessionSnapshot {
   input?: { revision: number; owner: "none" | "local" | "agent" | "unknown" };
 }
 export interface TerminalAskOptions { kind?: "command" | "message"; confirmEmptyInput?: boolean }
+export interface TerminalCollectTaskOptions {
+  /** From read_task.task.revision; harmless terminal output does not invalidate it. */
+  expectedTaskRevision?: number;
+  /** Legacy screen observation guard. Prefer expectedTaskRevision for an observed answer. */
+  expectedSequence?: number;
+  answer?: string;
+  completion?: "agent_observed";
+}
 let sessionCounter = 0;
 function sessionIdentity(): string {
   // Identity is metadata, never an authorization credential. The fallback also
@@ -36,10 +44,14 @@ export class TerminalSession implements Disposable {
   private subscriptions: Disposable[];
   private receipts = new Map<string, { signature: string; receipt: InputReceipt }>();
   private sequenceValue = 0;
+  private outputSequenceValue = 0;
   private disposed = false;
   private executionPending = false;
   private sessionId = sessionIdentity();
   private inputRevision = 0;
+  private applicationObservationRevision = 0;
+  private applicationObservationId = sessionIdentity();
+  private shellPromptObserved = false;
   private inputOwner: "none" | "local" | "agent" | "unknown" = "unknown";
   private hostInputEmpty = false;
   private composer?: TerminalComposerContent;
@@ -63,6 +75,7 @@ export class TerminalSession implements Disposable {
         this.tasks.attention("Terminal state changed. Inspect it before continuing the handoff.");
       }
       if (event.type === "write") {
+        this.outputSequenceValue++;
         if (this.applicationBuffer !== terminal.core.type) {
           this.inputOwner = "unknown"; this.inputRevision++; this.clearApplicationState();
           this.tasks.attention("The application buffer changed. Inspect the current application before continuing.");
@@ -80,8 +93,9 @@ export class TerminalSession implements Disposable {
       changed();
     }), terminal.core.command.event(marker => {
       if (marker.kind === "output" || marker.kind === "finished" || marker.kind === "prompt") this.executionPending = false;
-      if (marker.kind === "command") { this.inputOwner = "none"; this.clearApplicationState(); }
+      if (marker.kind === "command") { this.inputOwner = "none"; this.clearApplicationState(); this.shellPromptObserved = true; }
     }), terminal.onInput(event => {
+      this.applicationObservationRevision++;
       this.hostInputEmpty = false; this.composer = undefined;
       if (event.source !== this.inputSource) {
         this.inputRevision++;
@@ -98,7 +112,13 @@ export class TerminalSession implements Disposable {
   }
   get id(): string { return this.sessionId; }
   get input() { return this.inputState(); }
-  get application(): TerminalApplicationState { return { ...this.applicationValue }; }
+  get application(): TerminalApplicationState {
+    if (this.applicationValue.source === null && this.shellPromptObserved && this.commands.atPrompt && !this.executionPending) return { ...this.applicationValue, status: "ready", source: "shell" };
+    return { ...this.applicationValue };
+  }
+  observeApplication(): TerminalApplicationObservation { this.assertLive(); return { sessionId: this.id, contextId: this.applicationObservationId, revision: this.applicationObservationRevision }; }
+  /** Host detachment or failed observation revokes all live semantic claims. No input is sent. */
+  invalidateApplicationState(): void { this.assertLive(); this.clearApplicationState(); this.change.fire(++this.sequenceValue); }
   get sequence(): number { return this.sequenceValue; }
   get recording(): TerminalRecorder | undefined { return this.recorder; }
   startRecording(maxBytes?: number): TerminalRecorder {
@@ -111,7 +131,7 @@ export class TerminalSession implements Disposable {
     const start = Math.max(0, Math.min(core.length, Math.floor(options.startRow ?? Math.max(0, core.length - count))));
     const lines = Array.from({ length: Math.min(count, core.length - start) }, (_, index) => core.getLine(start + index)!.translateToString(true));
     return {
-      sequence: this.sequence, title: core.title, directory: core.directory || null,
+      sequence: this.sequence, outputSequence: this.outputSequenceValue, title: core.title, directory: core.directory || null,
       cols: core.cols, rows: core.rows, buffer: core.type, modes: { ...core.modes },
       cursor: { row: core.cursorY, column: core.cursorX, visible: core.cursorVisible },
       viewportY: this.terminal.buffer.active.viewportY, selection: this.terminal.getSelection(),
@@ -202,6 +222,7 @@ export class TerminalSession implements Disposable {
     }
     const revision = this.inputRevision;
     // A previous turn's lifecycle is not progress for the new request.
+    this.applicationObservationRevision++;
     this.applicationValue = { status: "unknown", source: null, revision: this.applicationValue.revision + 1 };
     this.tasks.begin({ id: taskId, prompt, kind, submittedSequence: this.sequence, ...(kind === "command" ? { commandId: this.commands.active?.id } : {}) });
     // The task exists before either input event, so even immediate shell output
@@ -218,50 +239,83 @@ export class TerminalSession implements Disposable {
     return this.tasks.get(taskId);
   }
   readTask(taskId: string) { return { task: this.tasks.get(taskId), terminal: this.read(), next: this.taskNext(taskId) }; }
-  async waitTask(taskId: string, afterRevision: number, timeoutMs = 15_000, signal?: AbortSignal) {
+  async waitTask(taskId: string, afterRevision: number, timeoutMs = 15_000, signal?: AbortSignal, afterOutputSequence?: number) {
     const task = this.tasks.get(taskId);
     if (!Number.isSafeInteger(afterRevision) || afterRevision < 0 || afterRevision > task.revision) throw new RangeError("Revision does not belong to this task");
+    if (!Number.isFinite(timeoutMs)) throw new RangeError("Task timeout must be finite");
+    if (afterOutputSequence !== undefined && (!Number.isSafeInteger(afterOutputSequence) || afterOutputSequence < 0 || afterOutputSequence > this.outputSequenceValue)) throw new RangeError("Output sequence does not belong to this session");
     if (this.disposed || signal?.aborted) throw new Error("Session wait cancelled");
-    const settled = (task: TerminalTask) => ["completed", "collected", "cancelled"].includes(task.status);
-    if (task.revision > afterRevision || settled(task)) return { ...this.readTask(taskId), timedOut: false };
+    const ready = () => {
+      const current = this.tasks.get(taskId), app = this.applicationValue;
+      return current.revision > afterRevision || ["completed", "collected", "cancelled"].includes(current.status)
+        || app.status === "authentication_required" || app.status === "input_required"
+        || app.taskId === taskId && app.status === "answer_ready";
+    };
+    const outputReady = () => afterOutputSequence !== undefined && this.outputSequenceValue > afterOutputSequence;
+    const result = () => ({ ...this.readTask(taskId), ...(this.taskNext(taskId) === "wait" && outputReady() ? { next: "inspect" as const } : {}), timedOut: false, reason: ready() ? "state" as const : "output" as const });
+    if (ready() || outputReady()) return result();
     const deadline = Date.now() + Math.max(1, Math.min(30_000, timeoutMs));
     for (;;) {
       const waited = await this.wait(this.sequence, Math.max(1, deadline - Date.now()), signal);
-      const current = this.tasks.get(taskId);
-      if (waited.timedOut || current.revision > afterRevision || settled(current) || Date.now() >= deadline) return { ...this.readTask(taskId), timedOut: waited.timedOut || Date.now() >= deadline };
+      // An actionable result wins even if it arrives on the timeout boundary.
+      if (ready() || outputReady()) return result();
+      if (waited.timedOut || Date.now() >= deadline) return { ...this.readTask(taskId), timedOut: true, reason: "timeout" as const };
     }
   }
   /** A trusted host adapter can supply actual application completion, without screen guessing. */
   completeTask(taskId: string, answer: string, options: { truncated?: boolean } = {}): TerminalTask {
     this.assertLive();
-    const task = this.tasks.complete(taskId, { text: answer, truncated: options.truncated === true, sequence: this.sequence, completion: "host" });
+    const previous = this.tasks.get(taskId);
+    if (["completed", "collected"].includes(previous.status) && previous.result?.completion === "host" && previous.result.text === answer && previous.result.truncated === (options.truncated === true)) return previous;
+    if (["completed", "collected", "cancelled"].includes(previous.status)) throw new Error("This task already has a final result or is closed");
+    const result = { text: answer, truncated: options.truncated === true, sequence: this.sequence, completion: "host" as const };
+    // Validate before publishing either state, so synchronous listeners see the
+    // completed answer and its host status together, with no partial transition.
+    TerminalTasks.validate([{ ...previous, status: "completed", result }]);
     this.applicationValue = { status: "answer_ready", source: "host", taskId, revision: this.applicationValue.revision + 1 };
+    this.applicationObservationRevision++;
+    const task = this.tasks.complete(taskId, result);
     this.change.fire(++this.sequenceValue); return task;
   }
   /**
    * Trusted host integration only. Observe real application state after capturing
-   * the sequence, and report before it changes. Decorative terminal text is not
+   * an observation token, and report before input or context changes. Terminal text is not
    * evidence. Report every composer/context change, and unknown on detachment.
    */
-  reportApplicationState(report: TerminalApplicationReport, expectedSequence: number): void {
-    this.assertLive(); validateApplicationReport(report); this.assertSequence(expectedSequence);
+  reportApplicationState(report: TerminalApplicationReport, observation: number | TerminalApplicationObservation): void {
+    this.assertLive(); validateApplicationReport(report);
+    if (typeof observation === "number") this.assertSequence(observation);
+    else if (!observation || observation.sessionId !== this.id || observation.contextId !== this.applicationObservationId || observation.revision !== this.applicationObservationRevision) throw new Error("Application state changed; observe the host again before reporting");
     if (report.taskId !== undefined) {
       const task = this.tasks.get(report.taskId);
-      if (["completed", "collected", "cancelled"].includes(task.status)) throw new Error("Application progress belongs to a closed task");
+      const retainedAnswer = ["completed", "collected"].includes(task.status) && report.taskId === this.applicationValue.taskId
+        && ["ready", "answer_ready"].includes(report.status) && this.tasks.pending.every(pending => pending.id === task.id);
+      if (["completed", "collected", "cancelled"].includes(task.status) && !retainedAnswer) throw new Error("Application progress belongs to a closed task");
     }
     if (report.composer !== undefined && this.terminal.inputComposing) throw new Error("Keyboard composition is still active; wait for committed input");
     const empty = ["empty", "placeholder", "suggestion"].includes(report.composer ?? "");
     if (empty && this.commands.atPrompt && this.commands.inputText) throw new Error("The marked shell prompt still contains input");
-    const changed = report.status !== this.applicationValue.status || report.taskId !== this.applicationValue.taskId || this.applicationValue.source !== "host" || report.composer !== undefined && report.composer !== this.composer;
+    const clearsComposer = ["unknown", "working", "authentication_required", "input_required"].includes(report.status);
+    const composer = report.composer ?? (clearsComposer ? undefined : this.composer);
+    const discardedInput = clearsComposer && (this.inputOwner === "agent" || this.hostInputEmpty);
+    const changed = report.status !== this.applicationValue.status || report.taskId !== this.applicationValue.taskId || this.applicationValue.source !== "host" || composer !== this.composer || discardedInput;
+    // Even an identical confirmation supersedes an older in-flight observation.
+    // Deduplicate task progress, never the freshness guard (including legacy sequences).
+    this.applicationObservationRevision++;
+    if (!changed) { this.change.fire(++this.sequenceValue); return; }
+    if (composer !== this.composer || discardedInput) this.inputRevision++;
     this.applicationValue = { status: report.status, source: "host", revision: this.applicationValue.revision + 1, ...(report.taskId === undefined ? {} : { taskId: report.taskId }) };
-    if (report.status === "unknown" || report.status === "working" || report.status === "authentication_required" || report.status === "input_required") { this.composer = undefined; this.hostInputEmpty = false; }
+    if (clearsComposer) {
+      this.composer = undefined; this.hostInputEmpty = false;
+      if (this.inputOwner === "agent") this.inputOwner = "unknown";
+    }
     if (report.composer !== undefined) {
       this.composer = report.composer; this.hostInputEmpty = false;
       // A report knows whether a value exists, not who authored it. It must
       // never confer submission ownership on a visiting agent.
       this.inputOwner = empty ? "none" : report.composer === "draft" ? "local" : this.inputOwner;
     }
-    if (changed) this.tasks.applicationChanged(report.taskId);
+    this.tasks.applicationChanged(report.taskId);
     this.change.fire(++this.sequenceValue);
   }
   /** Owner acknowledgement for an unintegrated TUI; cannot contradict a host-reported draft. */
@@ -269,22 +323,28 @@ export class TerminalSession implements Disposable {
     this.assertLive(true);
     if (expectedRevision !== this.inputRevision || this.terminal.inputComposing || this.composer === "draft" || this.commands.atPrompt && Boolean(this.commands.inputText)) throw new Error("Input changed; inspect the application's composer again");
     const changed = this.input.state !== "empty" || this.input.protected;
+    this.applicationObservationRevision++;
     this.inputOwner = "none"; this.hostInputEmpty = true;
     if (changed) this.tasks.applicationChanged();
     this.change.fire(++this.sequenceValue);
   }
-  collectTask(taskId: string, options: { expectedSequence?: number; answer?: string; completion?: "agent_observed" } = {}) {
+  collectTask(taskId: string, options: TerminalCollectTaskOptions = {}) {
     this.assertLive();
     const task = this.tasks.get(taskId);
     if (task.status === "collected" || task.status === "cancelled") return this.readTask(taskId);
     if (task.status === "completed") this.tasks.collect(taskId);
     else {
-      this.assertSequence(options.expectedSequence);
+      if (options.answer !== undefined || options.completion !== undefined) {
+        if (options.expectedTaskRevision !== undefined) {
+          if (!Number.isSafeInteger(options.expectedTaskRevision) || options.expectedTaskRevision !== task.revision) throw new Error("Task state changed; read this task again before confirming its answer");
+        } else this.assertSequence(options.expectedSequence);
+      }
       const result: TerminalTaskResult = {
         text: options.answer ?? this.read({ maxRows: 100 }).lines.join("\n").slice(0, 32768),
         truncated: options.answer === undefined, sequence: this.sequence,
       };
       if (options.completion === "agent_observed") {
+        this.assertApplicationAvailable();
         if (!options.answer?.trim()) throw new Error("Include the actual answer before confirming observed completion. A quiet screen is not completion.");
         this.tasks.complete(taskId, { ...result, completion: "agent_observed" }); this.tasks.collect(taskId);
       } else this.tasks.collect(taskId, result);
@@ -330,7 +390,10 @@ export class TerminalSession implements Disposable {
     if (this.applicationValue.status === "input_required") throw new Error("The application needs a response to its current dialog. Inspect it before continuing; a new prompt was not sent.");
   }
   private clearApplicationState(): void {
-    const changed = this.applicationValue.source !== null || this.composer !== undefined;
+    const changed = this.applicationValue.source !== null || this.composer !== undefined || this.inputOwner === "agent" || this.hostInputEmpty || this.shellPromptObserved;
+    this.applicationObservationRevision++;
+    this.shellPromptObserved = false;
+    if (this.inputOwner === "agent") { this.inputOwner = "unknown"; this.inputRevision++; }
     this.composer = undefined; this.hostInputEmpty = false; this.applicationBuffer = this.terminal.core.type;
     this.applicationValue = { status: "unknown", source: null, revision: this.applicationValue.revision + 1 };
     if (changed) this.tasks.applicationChanged();

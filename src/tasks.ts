@@ -68,7 +68,7 @@ export class TerminalTasks implements Disposable {
     for (const task of this.records) if (["waiting", "needs_attention"].includes(task.status) && !task.outputObserved) this.update(task.id, { outputObserved: true });
   }
   attention(note: string): void {
-    for (const task of this.records) if (task.status === "waiting") this.update(task.id, { status: "needs_attention", note: note.slice(0, 1024) });
+    for (const task of this.records) if (["waiting", "needs_attention"].includes(task.status)) this.update(task.id, { status: "needs_attention", note: note.slice(0, 1024) });
   }
   /** Wake a retained handoff for application progress, without declaring completion. */
   applicationChanged(taskId?: string): void {

@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
 import type { TerminalSession } from "../../src/session.js";
+import type { TerminalApplicationReport, TerminalApplicationCompletion } from "../../src/application.js";
 
-declare global { interface Window { handoffSession: TerminalSession } }
+declare global { interface Window { handoffSession: TerminalSession; handoffHost: { report(state: TerminalApplicationReport): void; complete(result: TerminalApplicationCompletion): void; dispose(): void } } }
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/test/browser/harness.html");
@@ -127,4 +128,37 @@ test("application progress is customizable and answer readiness does not collect
   await expect(page.locator("[data-task-status]")).toHaveText("Answer ready to collect");
   await page.evaluate(() => { window.handoffSession.collectTask("lifecycle"); });
   await expect(page.locator("[data-task-status]")).toHaveText("Answer collected");
+});
+
+test("a bound host reports input and completion, including an answer ready before a wait begins", async ({ page }) => {
+  await page.evaluate(() => {
+    const { terminal, library } = window.fixture, session = window.handoffSession;
+    terminal.write("\x1b[?1049h\x1b[?2004h");
+    let state: TerminalApplicationReport = { status: "ready", composer: "suggestion" };
+    let changed: (() => void) | undefined, completed: ((result: TerminalApplicationCompletion) => void) | undefined;
+    const binding = library.attachTerminalApplication(session, {
+      getState: () => state,
+      onStateChange(listener) { changed = listener; return { dispose() { changed = undefined; } }; },
+      onTaskComplete(listener) { completed = listener; return { dispose() { completed = undefined; } }; },
+    });
+    window.handoffHost = { report(value) { state = value; changed?.(); }, complete(result) { completed?.(result); }, dispose: () => binding.dispose() };
+    session.ask("Review", "bound", session.sequence);
+    window.handoffHost.report({ status: "working", taskId: "bound" });
+  });
+  expect(await page.evaluate(() => window.handoffSession.application)).toMatchObject({ status: "working", source: "host" });
+  await page.evaluate(() => window.handoffHost.report({ status: "answer_ready", composer: "suggestion", taskId: "bound" }));
+  const ready = await page.evaluate(() => {
+    const session = window.handoffSession;
+    return session.waitTask("bound", session.tasks.get("bound").revision, 50);
+  });
+  expect(ready).toMatchObject({ next: "inspect", timedOut: false, terminal: { input: { state: "empty", content: "suggestion", verifiedBy: "host" } } });
+  await page.evaluate(() => window.handoffHost.complete({ taskId: "bound", answer: "The actual final answer." }));
+  const answer = await page.evaluate(() => {
+    const session = window.handoffSession;
+    window.fixture.terminal.write("\x1b[1;1HBackground redraw");
+    return session.collectTask("bound");
+  });
+  expect(answer).toMatchObject({ next: "done", task: { status: "collected", result: { text: "The actual final answer.", completion: "host" } } });
+  await page.evaluate(() => window.handoffHost.dispose());
+  expect(await page.evaluate(() => window.handoffSession.application.source)).toBeNull();
 });

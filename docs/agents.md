@@ -125,7 +125,7 @@ and returns the screen, input guard and retained task summaries.
 | `read`, `tasks` | Inspect the current application and existing handoffs. |
 | `ask` | Check the current input and submit one complete prompt with a stable task ID. |
 | `read_task` | Retrieve a task, its retained result, current terminal state and next step. |
-| `wait_task` | Wait for new task progress, with a bounded timeout. |
+| `wait_task` | Wait for task progress or optional output changes; return an already-actionable state immediately. |
 | `collect_task` | Retain partial output, or collect a completed answer. Leaves the connection open. |
 | `cancel_task` | Explicitly abandon a handoff record. Does not interrupt the application. |
 
@@ -145,6 +145,32 @@ Wait using the returned task revision, then collect its result:
 ```json
 {"method":"collect_task","args":{"taskId":"workdir-1"}}
 ```
+
+An already reported `answer_ready`, authentication request, input dialog, or
+retained final answer returns immediately, even if its task revision was already
+read. Follow `next`: `authenticate`, `inspect`, `collect`, `wait`, or `done`.
+`timedOut: true` means the wait expired without new evidence; it never means done.
+When application state is `unknown`, inspect the returned screen first: `next:
+"wait"` means no structured completion event is available, not that the final
+answer is absent. An answer may already have arrived before that read. A control
+grant can explicitly collect an observed final answer as described below;
+read-only agents can read and report it without changing task state.
+
+For an application without lifecycle reports, pass `afterOutputSequence` from
+`read_task.terminal.outputSequence` alongside the task revision. This also wakes
+for output that arrived between the read and the wait, including after an earlier
+"background job started" acknowledgement. Replace both example numbers with
+values from that same read:
+
+```json
+{"method":"wait_task","args":{"taskId":"review-1","afterRevision":3,"afterOutputSequence":42,"timeoutMs":15000}}
+```
+
+`reason: "output"` means inspect the returned terminal text; it does **not** mark
+the task completed. `reason: "state"` means task or actionable host state is
+available. `reason: "timeout"` means neither arrived. Update both cursors from
+each response. With a reliable host integration, omit the output cursor to wait
+for lifecycle events instead of every redraw.
 
 Use a new task ID for a new request. Retrying the same ID and prompt retrieves the
 existing task without submitting it again. A new handoff is blocked until the
@@ -187,7 +213,22 @@ For such an application, `collect_task` without completion evidence stores an
 unconfirmed screen excerpt and leaves the task pending. It may include earlier
 context and is marked truncated. After observing the actual requested answer,
 the agent can submit `answer`, `completion: "agent_observed"`, and
-`expectedSequence` from a fresh read. The result retains that provenance.
+`expectedTaskRevision` from `read_task.task.revision`. Ordinary output and redraws
+do not invalidate this task observation. Local input, task changes, and new host
+state do. A host reporting work, authentication, or an input dialog blocks an
+observed-completion claim. The result retains the `agent_observed` provenance;
+the revision is a concurrency guard, not proof that the answer is correct.
+
+```json
+{"method":"collect_task","args":{"taskId":"review-1","expectedTaskRevision":3,"answer":"The colleague's actual final findings.","completion":"agent_observed"}}
+```
+
+Collecting an already completed result or retaining current partial output needs
+no sequence. Repeating collection returns the same retained answer. The older
+`expectedSequence` guard remains accepted for explicitly supplied answers, but
+can reject a screen observation after a harmless redraw. New clients should use
+`expectedTaskRevision` for observed answers; input still requires a fresh terminal
+sequence.
 
 Hosts with a real application integration can report completion directly:
 
@@ -233,22 +274,59 @@ reporting method is available to a visiting agent through the relay.
 
 ## Application and composer state
 
-Hosts can report the actual application state to the library. This is an
-integration API, not a terminal screen classifier. It requires a fresh sequence
-and rejects unknown fields, including composer values or raw hook payloads.
+Hosts can wire their real application model once with
+`attachTerminalApplication`. State notifications read the model synchronously;
+completion events retain the final answer and wake waiting agents. The model
+must report every editor/lifecycle change, including edits from other clients.
+This API does not install a Claude plugin or infer a TUI's state from pixels.
+
+```js
+import { attachTerminalApplication } from 'refstream.js';
+
+const binding = attachTerminalApplication(session, {
+  getState() {
+    return {
+      status: application.status,
+      taskId: application.acceptedTaskId, // Exact accepted request, not the latest visible task.
+      composer: editor.value.length > 0 ? 'draft'
+        : editor.suggestion ? 'suggestion'
+        : editor.placeholder ? 'placeholder' : 'empty',
+    };
+  },
+  onStateChange: listener => application.onStateChange(listener),
+  onTaskComplete: listener => application.onFinalAnswer(({ taskId, answer }) => {
+    listener({ taskId, answer });
+  }),
+});
+
+// Before replacing the application/process:
+binding.dispose();
+```
+
+Here `application` and `editor` are the embedding host's trusted models.
+Subscriptions return `{ dispose() }`; `onTaskComplete` is optional when the
+host cannot identify a final answer. Pass only an accepted request's actual task
+ID. Do not map arbitrary background-job or stop events to completion. Duplicate
+identical final events are harmless, including after collection; a different
+answer cannot overwrite an already final result. Binding replacement or
+detachment removes subscriptions and revokes live semantic claims. A failed
+state read also revokes them and reports the error to the host.
+
+Lower-level integrations can report state directly. Unknown fields, including
+composer values or raw hook payloads, are rejected:
 
 ```js
 // Inside the host's synchronous application-state callback:
-const sequence = session.sequence; // Capture before observing the application.
+const observation = session.observeApplication(); // Capture before observing the application.
 const composer = editor.value.length > 0 ? 'draft'
   : editor.suggestion ? 'suggestion'
   : editor.placeholder ? 'placeholder' : 'empty';
-session.reportApplicationState({ status: 'ready', composer }, sequence);
+session.reportApplicationState({ status: 'ready', composer }, observation);
 
 // Application lifecycle callbacks, associated with the actual current handoff:
-session.reportApplicationState({ status: 'authentication_required', taskId }, session.sequence);
-session.reportApplicationState({ status: 'working', taskId }, session.sequence);
-session.reportApplicationState({ status: 'answer_ready', taskId }, session.sequence);
+session.reportApplicationState({ status: 'authentication_required', taskId }, session.observeApplication());
+session.reportApplicationState({ status: 'working', taskId }, session.observeApplication());
+session.reportApplicationState({ status: 'answer_ready', taskId }, session.observeApplication());
 // Only after the requested answer has actually arrived:
 session.completeTask(taskId, finalAnswer);
 ```
@@ -266,14 +344,24 @@ callbacks should observe state after the atomic input operation finishes.
 
 A reported composer survives ordinary output/redraws. All terminal input and
 IME composition invalidate it, as do reset, restore and a buffer change. The
-integration must report every application/composer/context change and report
-`{ status: 'unknown', composer: 'unknown' }` when it detaches. Apply backend
-events in order and associate them with the correct process and task. For an
-asynchronous observation, retain the sequence captured **before** the observation;
-a rejected stale report needs a fresh observation, not a newly stamped sequence.
+integration must report every application/composer/context change and call
+`session.invalidateApplicationState()` when it detaches. Apply backend events
+in order and associate them with the correct process and task. For an asynchronous
+observation, retain the token captured **before** observing the host, not a new
+token stamped when the response arrives. A token survives output and rendering,
+but input, newer host evidence, submission, reset, restore, and detachment
+invalidate it. A rejected report requires a fresh observation. The older numeric
+sequence argument remains supported and is invalidated by every terminal change.
+New confirmations supersede older observations even when their visible state is
+identical; they do not manufacture a new task-progress revision. Detachment and
+composer-invalidating lifecycle transitions also revoke ownership of earlier
+agent input, so an old draft cannot be submitted into a different application.
 
 `read().application` supplies `status`, `source`, `revision` and optional `taskId`.
 The default status is `unknown`; it is never inferred from output or silence.
+An explicitly marked, idle shell prompt reports `ready` with `source: "shell"`.
+That does not identify the state of a TUI running inside that shell. Semantic
+application reports use `source: "host"`; unavailable state has `source: null`.
 
 | Application status | Agent behavior |
 | --- | --- |

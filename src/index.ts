@@ -3,9 +3,9 @@ export { TerminalCore, type TerminalModes, type CommandMarker, type TerminalActi
 export type { TerminalState } from "./state.js";
 export { CommandTracker, type CommandRecord } from "./commands.js";
 export { TerminalRecorder, replayRecording, type TerminalRecording, type RecordingEvent } from "./recording.js";
-export { TerminalSession, getTerminalSession, type SessionSnapshot, type InputReceipt, type TerminalAskOptions } from "./session.js";
+export { TerminalSession, getTerminalSession, type SessionSnapshot, type InputReceipt, type TerminalAskOptions, type TerminalCollectTaskOptions } from "./session.js";
 export { TerminalTasks, type TerminalTask, type TerminalTaskStatus, type TerminalTaskResult, type TerminalTaskCompletion } from "./tasks.js";
-export type { TerminalApplicationStatus, TerminalApplicationState, TerminalApplicationReport, TerminalComposerContent, TerminalInputState } from "./application.js";
+export { attachTerminalApplication, type TerminalApplicationAdapter, type TerminalApplicationCompletion, type TerminalApplicationObservation, type TerminalApplicationStatus, type TerminalApplicationState, type TerminalApplicationReport, type TerminalComposerContent, type TerminalInputState } from "./application.js";
 export { connectTerminalAgent, validateTerminalAgentPairing, handleTerminalAgentRequest, type TerminalAgentOptions, type TerminalAgentRequest } from "./mcp.js";
 export { createTerminalAgentInvitation, type TerminalAgentInvitation, type TerminalAgentInvitationOptions, type TerminalAgentClientSource } from "./invitation.js";
 export { getTerminalAgentAccess, type TerminalAgentAccess, type TerminalAgentAccessState } from "./agent-access.js";

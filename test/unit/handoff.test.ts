@@ -14,6 +14,80 @@ function fixture(application = false) {
 afterEach(() => { for (const session of sessions.splice(0)) { session.dispose(); session.terminal.dispose(); } });
 
 describe("persistent agent handoffs", () => {
+  it.each(["authentication_required", "input_required", "answer_ready"] as const)("does not wait behind a timeout when %s is already actionable", async status => {
+    const { session } = fixture(true);
+    session.ask("Review", "review", session.sequence, { confirmEmptyInput: true });
+    session.reportApplicationState({ status, taskId: "review" }, session.observeApplication());
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const waited = await session.waitTask("review", session.tasks.get("review").revision, 10);
+      expect(waited).toMatchObject({ timedOut: false, reason: "state", next: status === "authentication_required" ? "authenticate" : "inspect" });
+      expect(timers).not.toHaveBeenCalled();
+    } finally { timers.mockRestore(); }
+  });
+
+  it("returns completion ahead of the deadline flag when the event loop resumes late", async () => {
+    vi.useFakeTimers();
+    try {
+      const { session } = fixture(true);
+      session.ask("Review", "review", session.sequence, { confirmEmptyInput: true });
+      const waiting = session.waitTask("review", session.tasks.get("review").revision, 1000);
+      session.completeTask("review", "Verified answer");
+      vi.setSystemTime(Date.now() + 2000);
+      expect(await waiting).toMatchObject({ next: "collect", timedOut: false, reason: "state" });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("can wake on subsequent output without pretending it completed an unintegrated task", async () => {
+    const { terminal, session } = fixture(true);
+    session.ask("Review", "review", session.sequence, { confirmEmptyInput: true });
+    terminal.write("Background job started.\r\n");
+    const read = session.readTask("review");
+    terminal.write("Actual findings have now arrived.\r\n");
+    const waited = await session.waitTask("review", read.task.revision, 1000, undefined, read.terminal.outputSequence);
+    expect(waited).toMatchObject({ next: "inspect", timedOut: false, reason: "output", task: { status: "waiting" } });
+    expect(waited.task.result?.completion).toBeUndefined();
+    const waiting = session.waitTask("review", waited.task.revision, 1000, undefined, waited.terminal.outputSequence);
+    terminal.write("More findings.\r\n");
+    expect(await waiting).toMatchObject({ next: "inspect", timedOut: false, reason: "output" });
+  });
+
+  it("collects retained or current output without requiring a terminal sequence", () => {
+    const { terminal, session } = fixture(true);
+    session.ask("Review", "review", session.sequence, { confirmEmptyInput: true });
+    terminal.write("Partial answer");
+    expect(session.collectTask("review").task).toMatchObject({ status: "waiting", result: { truncated: true } });
+    const sequence = session.sequence;
+    terminal.write(" updated");
+    expect(session.collectTask("review", { expectedSequence: sequence }).task.result?.text).toContain("updated");
+    session.completeTask("review", "Final answer");
+    const first = session.collectTask("review");
+    terminal.write("\r\nUnrelated output");
+    expect(session.collectTask("review").task).toEqual(first.task);
+  });
+
+  it("collects an observed answer against the task revision while harmless output continues", async () => {
+    const { terminal, session } = fixture(true);
+    session.ask("Review", "review", session.sequence, { confirmEmptyInput: true });
+    terminal.write("Final answer\r\n");
+    const read = session.readTask("review");
+    for (let index = 0; index < 10; index++) terminal.write("\x1b[1;1HFinal answer\x1b[?25h");
+    const collected = await handleTerminalAgentRequest(session, { method: "collect_task", args: { taskId: "review", expectedTaskRevision: read.task.revision, answer: "Final answer", completion: "agent_observed" } }, "control");
+    expect(collected).toMatchObject({ next: "done", task: { status: "collected", result: { text: "Final answer", completion: "agent_observed" } } });
+  });
+
+  it("rejects a task observation after each local edit or a newer host state", () => {
+    const { terminal, session } = fixture(true);
+    session.ask("Review", "review", session.sequence, { confirmEmptyInput: true });
+    terminal.paste("first edit");
+    const revision = session.tasks.get("review").revision;
+    terminal.paste("second edit");
+    expect(() => session.collectTask("review", { expectedTaskRevision: revision, answer: "Old answer", completion: "agent_observed" })).toThrow("Task state changed");
+    session.reportApplicationState({ status: "working", taskId: "review" }, session.observeApplication());
+    expect(() => session.collectTask("review", { expectedTaskRevision: session.tasks.get("review").revision, answer: "Not complete", completion: "agent_observed" })).toThrow("working");
+    expect(session.tasks.get("review").result).toBeUndefined();
+  });
+
   it("submits once, waits for explicit shell completion, collects, then reuses the same session", () => {
     const { terminal, session, sent } = fixture();
     const id = session.id, sequence = session.sequence;

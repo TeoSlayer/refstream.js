@@ -179,6 +179,11 @@ Completion comes from shell markers, a host callback, or an explicitly labelled
 observation by the visiting agent. Quiet output alone is never completion.
 Host integrations can report the composer's state as empty, placeholder,
 suggestion or draft, and expose authentication, working and answer-ready states.
+`attachTerminalApplication(session, adapter)` keeps a host model and its final
+answer events connected for the application's lifetime. Actionable host states
+return immediately from waits; collection uses a task revision so unrelated
+redraws do not force retries. Unintegrated hosts can opt into output-change waits
+to inspect new findings promptly without inventing a completion event.
 Unintegrated applications retain an explicit unknown state and bounded visual
 evidence; terminal colors never authorize input on their own.
 See [persistent sessions and agent APIs](docs/agents.md) for usage, host hooks,

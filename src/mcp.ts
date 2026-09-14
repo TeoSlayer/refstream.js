@@ -56,10 +56,10 @@ export async function handleTerminalAgentRequest(session: TerminalSession, reque
       return session.ask(text("prompt"), text("taskId", 128), expected(), { kind: args.kind, confirmEmptyInput: args.confirmEmptyInput === true });
     }
     case "read_task": return session.readTask(text("taskId", 128));
-    case "wait_task": return session.waitTask(text("taskId", 128), number("afterRevision", 0)!, Math.min(number("timeoutMs", 15_000)!, 30_000), signal);
+    case "wait_task": return session.waitTask(text("taskId", 128), number("afterRevision", 0)!, Math.min(number("timeoutMs", 15_000)!, 30_000), signal, number("afterOutputSequence"));
     case "collect_task": {
       if (args.completion !== undefined && args.completion !== "agent_observed") throw new TypeError("Only the host or shell may report their own completion events");
-      return session.collectTask(text("taskId", 128), { expectedSequence: number("expectedSequence"), answer: args.answer === undefined ? undefined : text("answer", 32768), completion: args.completion });
+      return session.collectTask(text("taskId", 128), { expectedTaskRevision: number("expectedTaskRevision"), expectedSequence: number("expectedSequence"), answer: args.answer === undefined ? undefined : text("answer", 32768), completion: args.completion });
     }
     case "cancel_task": return session.cancelTask(text("taskId", 128), text("reason", 1024));
     case "can_disconnect": session.assertCanDisconnect(); return { allowed: true };
