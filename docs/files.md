@@ -1,12 +1,22 @@
-# Optional file streams
+# Files, previews and peer-to-peer streams
 
-A small, independent JavaScript library for file references backed by **Web Streams, Blobs, explicit URLs, or WebRTC peer-to-peer streams**. Use it with Shell Terminal or your own interface. No UI framework, runtime dependencies, telemetry, automatic network connections, or filesystem access.
+[Library](../README.md) · [Agent sessions](agents.md) · [Security and E2EE](security.md)
+
+`refstream.js/files` is the optional file-source module of Refstream.js. It maps
+registered references to **Web Streams, Blobs, explicit URLs or WebRTC streams**.
+Use it with Refstream's terminal previews or your own interface. It has no runtime
+dependencies, UI framework, automatic network connections or filesystem access.
 
 This is an alpha library. Browser JavaScript and npm distribution formats are built and tested here; the npm package has not been published yet.
 
+File sharing is separate from agent access. An agent invitation does not create
+a file connection. WebRTC encrypts file bytes between the peers; URL and custom
+stream sources use the transport supplied by the host. See
+[which connection is encrypted](security.md#which-connection-is-encrypted).
+
 ## Load JavaScript
 
-Copy `dist/browser/` to your static host. The ES module is self-contained:
+Copy `dist/browser/` to your static host, keeping `chunks/` beside the modules:
 
 ```js
 import { FileRegistry, fileLinks, createFilePeer } from '/vendor/refstream/files.js';
@@ -14,21 +24,37 @@ import { FileRegistry, fileLinks, createFilePeer } from '/vendor/refstream/files
 
 Or load `files.global.js` with a regular script tag and use `window.RefstreamFiles`. No bundler or installer is required. Serve JavaScript with its correct MIME type; permit cross-origin module loading only if needed. Run `npm ci && npm run build` to produce the browser files. Keep the MIT license with them.
 
-For npm/bundler use after publication:
-
-```sh
-npm install refstream.js
-```
+For a bundler, install a tarball produced with `npm pack` in a built checkout,
+then use the package import. There is no separate files package to install:
 
 ```js
 import { FileRegistry, fileLinks, createFilePeer } from 'refstream.js/files';
 ```
 
+The examples below use package imports. For direct browser modules, substitute
+`/vendor/refstream/files.js` as in the first example. Container elements, backing
+Blobs and authenticated signaling callbacks belong to your application.
+
 ## Register actual sources
 
 Only explicit registrations can become file links. Detection and `has()` are local lookups; they never open a stream or fetch a URL.
 
+```mermaid
+flowchart TD
+    accTitle: A detected filename is not a file permission
+    accDescr: Only registered references become clickable. Preview authorizes a bounded read. Download separately authorizes the original file. Unknown references make no request.
+    O["Filename in terminal output"] --> C{"Registered?"}
+    C -->|"No"| N["Ordinary text<br/>No request"]
+    C -->|"Yes"| L["Clickable reference<br/>No bytes fetched"]
+    L -->|"Hover, focus or tap"| P["Preview<br/>Authorize and read bounded bytes"]
+    P -->|"Click Download"| D["Original file<br/>Authorize again and save"]
+    classDef action fill:#e8f1ff,stroke:#3569a8,color:#132f50
+    class P,D action
+```
+
 ```js
+import { FileRegistry } from 'refstream.js/files';
+
 const files = new FileRegistry({
   allowedOrigins: ['https://files.example.com'],
 });
@@ -58,10 +84,17 @@ Supply exactly one backing per file (and per optional preview): a string/Blob `b
 
 URL sources require an exact origin allowlist and are fetched without cookies, credentials, referrers, redirects, or caching. For authenticated HTTP endpoints, supply your own stream factory that authorizes the user, session and file on every request. **Never construct a fetch URL or filesystem path from detected text.** Register the mapping from a trusted application catalog.
 
+Use HTTPS for remote URL sources. An allowed origin permits a request; it does
+not hide the file from the provider serving it. `authorize` and the backing
+backend both belong to the host's access model. A browser callback alone cannot
+secure a public storage URL.
+
 ## Connect a terminal or your own UI
 
 ```js
-// An existing Shell Terminal instance:
+import { fileLinks } from 'refstream.js/files';
+
+// An existing Refstream Terminal instance:
 terminal.options.fileLinks = {
   ...fileLinks(files),
   hoverDelayMs: 300,
@@ -69,12 +102,26 @@ terminal.options.fileLinks = {
 };
 ```
 
-The adapter supplies local availability, resolution and change events. Adding or withdrawing a source updates links automatically; a revoked preview closes. Only registered paths link. The terminal owns its customizable preview/download UI; this library owns the file sources.
+The adapter supplies local availability, resolution and change events. Adding or withdrawing a source updates links automatically; a revoked preview closes. Only registered paths link. The terminal owns its customizable preview/download UI; the files module owns the file sources.
+
+Hover or keyboard focus previews a reference; clicking or tapping pins it open.
+Text stays plain text, supported images/video use browser media elements, and
+active documents are not executed. Unsupported formats still have Download.
+The browser's codec support determines which videos can play.
+
+The [file UI options](../src/file-preview.ts) let a host replace actions, labels,
+tooltips, preview content or the complete popover. Set
+`terminal.options.fileLinks.download(reference, { signal })` to integrate an
+embedded browser's native save bridge. This host callback must authorize the
+file again and enforce its own read limits before saving. The default
+save path uses a Blob download and remains subject to the browser's download
+policy; it is not a filesystem API. A save callback must surface failure rather
+than resolve successfully without saving the bytes.
 
 For another interface:
 
 ```js
-import { detectFiles } from '/vendor/refstream/files.js';
+import { detectFiles } from 'refstream.js/files';
 
 const matches = detectFiles('Created plots/results.png and README.md:4', files);
 // Each match has start/end UTF-16 offsets, text, file metadata, and optional line/column.
@@ -95,9 +142,33 @@ Render names and text as text, not HTML. `detectFiles()` matches only explicitly
 
 File bytes travel over an encrypted WebRTC data channel. Your application authenticates the two peers and exchanges the offer and answer through its existing HTTPS/WebSocket signaling. No signaling service, STUN server or TURN server is hardcoded into the library.
 
+```mermaid
+flowchart LR
+    accTitle: File signaling and file bytes use separate paths
+    accDescr: The host authenticates signaling between the file sender and viewer. File bytes travel on an encrypted data channel, directly or through a configured TURN forwarder. The agent relay is not involved.
+    S["File sender<br/>Scoped registry"] <-->|"Offer / answer"| H["Host-authenticated signaling"]
+    H <-->|"Offer / answer"| V["Viewer<br/>Terminal preview"]
+    S <-->|"Direct: encrypted file bytes"| V
+    S <-->|"Alternative network path"| T["Optional TURN<br/>Encrypted packets"]
+    T <-->|"Same encrypted data channel"| V
+    classDef endpoint fill:#e8f1ff,stroke:#3569a8,color:#132f50
+    classDef infra fill:#f3f4f6,stroke:#667085,color:#27303f
+    class S,V endpoint
+    class H,T infra
+```
+
+The two endpoints can read the shared files. A TURN forwarder cannot decrypt
+their data channel, but sees connection metadata. Trusted signaling identifies
+the intended peer; substituting an offer or answer can connect a different peer.
+Descriptions can expose network addresses, so treat them as private session
+metadata. WebRTC encryption does not replace peer authentication or file access
+checks. Interrupted transfers do not resume automatically.
+
 On the computer/browser sharing files:
 
 ```js
+import { createFilePeer } from 'refstream.js/files';
+
 const sender = createFilePeer({
   files: filesForThisAuthorizedViewer,
   rtcConfiguration: yourRtcConfiguration,
@@ -117,6 +188,8 @@ try {
 On the viewing page:
 
 ```js
+import { createFilePeer, fileLinks } from 'refstream.js/files';
+
 const viewer = createFilePeer({ rtcConfiguration: yourRtcConfiguration });
 try {
   const answer = await viewer.acceptOffer(offerFromAuthenticatedSender);
@@ -150,9 +223,20 @@ If your app already has WebRTC, use `new FileChannel(dataChannel, { files })`. C
 
 Preview limits can be configured up to 128 MiB; download limits up to 1 GiB. Actual streamed bytes enforce the cap regardless of size metadata. Stream factories should emit moderate chunks; the sender retains at most one upstream chunk per transfer and sends one binary message (at most 16 KiB) for each consumer credit. Readers that stop consuming must cancel the stream, or the idle timeout will release it. Slow consumers never create an unbounded output queue.
 
+The terminal's preview UI has its own, lower limits: 8 MiB previews and 64 MiB
+downloads by default, configurable up to 16 MiB and 128 MiB respectively. The
+effective limit is the smaller limit along the read path. Larger downloads
+through the headless API need a host-owned streaming destination, rather than
+raising a limit and buffering the whole file in a tooltip.
+
 Registry disposal withdraws sources and aborts active reads. Peer/channel disposal cancels transfers and closes its connection; it does not dispose an application-owned registry. Connection loss fails outstanding reads. Reconnection and retry require a new peer and freshly authorized stream; there is no silent resume or persistent storage. `FileAccessError.code` reports `UNAVAILABLE`, `DENIED`, `LIMIT`, `ABORTED`, `TIMEOUT`, `DISCONNECTED`, or `PROTOCOL`, without exposing source exception details.
 
 The library uses standard Web Streams, `fetch`, AbortController and WebRTC data channels. Serve peer connections from HTTPS or localhost. Automated browser tests exercise Chromium, Firefox, WebKit and mobile browser profiles; physical devices, internet NAT traversal and your own TURN infrastructure need deployment-specific verification.
+
+Neither snapshots nor recordings retain resolved preview bytes or backing
+objects. A filename or URL printed in terminal output is still retained as text.
+Downloaded files are ordinary plaintext artifacts; their storage and sharing
+are controlled by the host and user.
 
 ## Build and verify
 
@@ -182,4 +266,5 @@ Protocol references: [WebRTC data channels](https://www.w3.org/TR/webrtc/#rtcdat
 
 The optional file submodule has no dependency on the renderer, a hosted relay, or Cloudflare. The main [Refstream.js library](../README.md) provides the terminal emulator. Licensed under [MIT](../LICENSE).
 
-Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/TeoSlayer/refstream.js/security/advisories/new). Do not include credentials or private file contents in public issues.
+See [security and E2EE](security.md) for the complete trust boundary and
+[private vulnerability reporting](../SECURITY.md) for suspected issues.

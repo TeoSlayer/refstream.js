@@ -1,8 +1,51 @@
 # Persistent terminal handoffs
 
+[Library](../README.md) · [Security and E2EE](security.md) · [Files](files.md)
+
 An invited agent uses its ordinary command tool to connect to an existing browser
 terminal. The terminal keeps the handoff records; the connection carries requests
 and responses. Collecting an answer does not disconnect it.
+
+**The agent connection is end-to-end encrypted between this page and the
+connector.** The hosted or a compatible self-hosted relay forwards ciphertext.
+The page and invited agent can read shared output; the agent's tool/chat provider
+may receive it too. The relay sees connection metadata, not the decrypted
+commands or answers. [Encryption coverage and limits](security.md) explain each
+boundary, including the separate shell connection and saved snapshots.
+
+## Invite an agent
+
+1. Open **Invite agent** in the terminal. Choose **Read only** or **Read and run
+   commands**. **Connection settings** lets you select a compatible relay.
+2. Press **Copy invitation** and paste the complete message into your coding
+   agent's chat with your request. The agent needs its ordinary command tool and
+   Node.js 22+; no MCP setup or special Shell tool is required.
+3. With read-only access, the agent inspects existing output and reports back.
+   With command access, it can submit requests, wait and collect answers. Keep
+   the connection for follow-ups. **Revoke access** ends it whenever you choose.
+
+Read-only access includes retained terminal output and task results. Command
+access additionally permits input in that existing process. Neither grant
+automatically shares a file catalog or establishes a WebRTC file connection.
+
+```mermaid
+flowchart LR
+    accTitle: Reuse a command-access connection for follow-ups
+    accDescr: With control access, connect, read the existing session, ask once, wait and collect. Follow-ups reuse the connection. Disconnect only when requested.
+    C["Connect"] --> A["Read, then ask"]
+    A --> W["Wait"]
+    W --> K["Collect answer"]
+    K -->|"Follow-up"| A
+    K -->|"On request"| D["Disconnect"]
+    classDef action fill:#e8f1ff,stroke:#3569a8,color:#132f50
+    class C,K action
+```
+
+Closing the panel preserves the connection. An unused hosted invitation expires
+after five minutes; the grant expires four hours after creation. A disconnected
+agent needs a fresh invitation, but can retrieve retained tasks from the same
+live terminal. Reloads need host-managed recovery and a live backend process;
+a snapshot does not restart the shell. See [what persists](#what-persists).
 
 ## Embed a session
 
@@ -29,6 +72,34 @@ Explicit `new TerminalSession(terminal)` instances can be supplied to the UI.
 Labels, tooltips, toolbar placement and complete panel renderers remain
 customizable through `TerminalUiOptions`.
 
+For a host-owned Copy button, use the same session-scoped access controller:
+
+```js
+import { getTerminalAgentAccess } from 'refstream.js';
+
+const access = getTerminalAgentAccess(session);
+
+// Call from your explicit Share / Copy action.
+async function createInvitation() {
+  const invitation = await access.create({
+    permission: 'read',
+    relayUrl: 'https://mcp.shell.online', // Or your compatible HTTPS relay.
+  });
+  // Give message to your own private copy UI; do not log or persist it.
+  return invitation.message;
+}
+
+// Owner action: access.revoke();
+// access.onChange(state => updateYourConnectionStatus(state));
+```
+
+Browser clipboard permissions may require a separate user click after creation.
+Keep the invitation in the current UI only, and surface creation errors. Choosing
+another relay changes routing, not the encrypted payload protocol. A custom relay
+must implement that protocol and serve the pinned connector, or the host must
+explicitly supply its own trusted connector URL and checksum. See
+[relay trust](security.md#how-the-agent-connection-works).
+
 ## Connect once, reuse the connection
 
 The owner chooses access and copies an invitation from the Agent panel. The copy
@@ -36,6 +107,9 @@ contains a standalone Node.js 22+ connector URL and its pinned SHA-256 checksum.
 The agent verifies that file, runs `node shell-agent.mjs connect`, and passes the
 private invitation on stdin or through the connector's hidden prompt. The private
 invitation must never appear in command arguments, shell commands, URLs or logs.
+
+The checksum verifies downloaded bytes against the trusted library's pin. It
+does not establish the identity or trustworthiness of the invited agent.
 
 `connect` returns **`sessionId`**, the connector handle. Use that same handle for
 `request`, `status` and `stop`. Reads also contain **`terminalSessionId`**, a
@@ -55,7 +129,8 @@ and returns the screen, input guard and retained task summaries.
 | `collect_task` | Retain partial output, or collect a completed answer. Leaves the connection open. |
 | `cancel_task` | Explicitly abandon a handoff record. Does not interrupt the application. |
 
-For example, after reading an empty marked shell prompt:
+For example, with command access at an empty marked shell prompt (replace `12`
+with the current sequence from your read):
 
 ```json
 {"method":"ask","args":{"kind":"command","prompt":"pwd","taskId":"workdir-1","expectedSequence":12}}
@@ -77,6 +152,21 @@ previous answer is collected or the task is explicitly abandoned. A read-only
 grant permits reading and waiting, but cannot submit or change a handoff.
 
 ## Completion is explicit
+
+```mermaid
+stateDiagram-v2
+    accTitle: A handoff remains pending until there is completion evidence
+    accDescr: A submitted task waits, or needs attention if its input or progress needs inspection. Explicit evidence completes it; collection retains the result. Cancellation abandons the record without stopping the application.
+    [*] --> waiting: ask
+    waiting --> needs_attention: Owner input or interrupted submission
+    waiting --> completed: Explicit completion evidence
+    needs_attention --> completed: Explicit completion evidence
+    waiting --> cancelled: Owner or agent abandons task
+    needs_attention --> cancelled: Owner or agent abandons task
+    completed --> collected: collect_task
+    collected --> [*]
+    cancelled --> [*]
+```
 
 The statuses are `waiting`, `needs_attention`, `completed`, `collected` and
 `cancelled`. A sent receipt, output, silence, a redraw, and a background-job
@@ -208,11 +298,25 @@ the relay. Map only supported states through your existing trusted host
 integration. The library does not install hooks or automatically identify every
 Claude screen. See [Claude Code hooks](https://code.claude.com/docs/en/hooks).
 
-## Persistence and privacy boundaries
+## What persists
+
+The live connection, terminal state and shell process have different lifetimes:
+
+| Event | Connection | Terminal and task state | Shell process |
+| --- | --- | --- | --- |
+| Close or remount the Agent panel | Stays connected | Retained in the same session | Unchanged |
+| Collect an answer | Stays connected | Result retained, within history limits | Unchanged |
+| Revoke, disconnect or grant expiry | Ends; reconnect with a fresh invitation | Retained while that terminal session remains alive | Host-controlled; no automatic interrupt |
+| Reload the page | Ends | Host must explicitly save and restore a snapshot | Must still exist in the backend to reattach |
+| Dispose the terminal/session | Ends | Live objects end; only host-saved exports remain | Host controls whether to stop it |
+
+Snapshots are data, not encrypted archives or process checkpoints. Task records
+include prompts and answers and can be as sensitive as the terminal output.
 
 - The connector survives ordinary command invocations, and the logical session
-  survives UI remounts. The hosted grant lasts up to four hours; the single-use
-  invitation expires after five minutes. The panel distinguishes those lifetimes.
+  survives UI remounts. The hosted grant expires four hours after invitation
+  creation; the single-use invitation expires after five minutes. The panel
+  distinguishes those lifetimes.
 - Task records and answers remain in the live terminal session after an agent
   disconnects. A fresh invitation to that same session can retrieve them without
   resubmitting the task. Used invitations cannot be replayed to reconnect.
@@ -230,3 +334,8 @@ Claude screen. See [Claude Code hooks](https://code.claude.com/docs/en/hooks).
   protected local IPC credentials, never terminal contents, answers or the private
   invitation. Host-saved snapshots contain private terminal data and need the
   same protection as the underlying session.
+
+The protocol has no forward secrecy: disclosing an invitation secret later can
+expose recorded ciphertext from that grant. Revocation stops future access, but
+does not erase already shared data. See [security and E2EE](security.md) for the
+full trust model and [private reporting](../SECURITY.md) for suspected issues.
