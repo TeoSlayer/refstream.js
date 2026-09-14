@@ -27,6 +27,7 @@ export function bindAgentInvitation(session: TerminalSession, panel: HTMLElement
   const taskContainer = query("[data-agent-task]"), taskCaption = query("[data-task-status]"), taskNote = query("[data-task-note]");
   const taskResult = query<HTMLDetailsElement>("[data-task-result]"), taskResultLabel = query("[data-task-result-label]"), taskResultText = query("[data-task-result-text]");
   const inputGuard = query("[data-agent-input-guard]"), inputNote = query("[data-agent-input-note]"), inputAllow = query<HTMLButtonElement>("[data-agent-input-allow]");
+  const applicationStatus = query("[data-agent-application]");
   const relays = ui.relays ?? [{ id: "hosted", label: "Shell · hosted", url: defaultTerminalRelay }];
   if (new Set(relays.map(relay => relay.id)).size !== relays.length || relays.some(relay => relay.id === "custom")) throw new TypeError("Relay IDs must be unique; custom is reserved");
   for (const relay of relays) {
@@ -149,32 +150,52 @@ export function bindAgentInvitation(session: TerminalSession, panel: HTMLElement
     grant.revoke(phase() === "connected" ? text("agentStopped", "Access revoked. Your shell is still running; tasks and answers are retained.") : text("invitationCancelled", "Invitation cancelled."));
   };
   toolbarStop.addEventListener("click", stop, { signal }); panelStop.addEventListener("click", stop, { signal });
+  let lastInputView = "", lastTaskView = "";
   function inputStatus() {
+    const input = session.input, app = session.application;
     const sharing = phase() === "connected" && grant.state.permission === "control";
-    const blocked = sharing && (session.input.owner === "local" || session.input.composing);
+    const key = JSON.stringify([sharing, input.state, input.content, input.protected, input.composing, app.status]);
+    if (key === lastInputView) return;
+    lastInputView = key;
+    const blocked = sharing && input.protected && !["authentication_required", "working", "input_required"].includes(app.status);
     inputGuard.hidden = !blocked;
     if (!blocked) return;
-    inputAllow.disabled = session.input.composing;
-    inputNote.textContent = session.input.composing ? text("agentInputComposing", "Your keyboard is still composing text. Agent input is paused.") : text("agentInputProtected", "Your draft is protected. Once you have cleared the application's input, confirm here so the agent can continue.");
+    inputAllow.hidden = input.composing || input.content === "draft";
+    inputNote.textContent = input.composing ? text("agentInputComposing", "Your keyboard is still composing text. Agent input is paused.")
+      : input.content === "draft" ? text("agentInputProtected", "Draft in progress. Agent input is paused.")
+      : text("agentInputUnverified", "Input changed. Check the composer before the agent continues. Suggested prompts do not need clearing.");
   }
   inputAllow.addEventListener("click", () => {
     try { session.confirmInputEmpty(session.input.revision); inputGuard.hidden = true; status.focus({ preventScroll: true }); }
-    catch { inputNote.textContent = text("agentInputNotEmpty", "The input is still occupied or changed. Clear your draft in the application first."); }
+    catch { inputNote.textContent = text("agentInputNotEmpty", "The composer changed or still contains a draft. Check the application's input again."); }
   }, { signal });
   function taskStatus() {
-    const tasks = session.tasks.summary(), task = tasks[tasks.length - 1];
+    const tasks = session.tasks.summary(), task = tasks[tasks.length - 1], app = session.application;
+    const key = JSON.stringify([task?.id, task?.revision, app.status, app.taskId, phase()]);
+    if (key === lastTaskView) return;
+    lastTaskView = key;
+    const active = task && ["waiting", "needs_attention"].includes(task.status);
+    const appLabels = { unknown: "State unavailable", ready: "Ready", authentication_required: "Authentication required", input_required: "Needs your response", working: "Working", answer_ready: "Answer ready" };
+    const progress = active && (app.status === "authentication_required" || app.status === "input_required" || app.taskId === task.id && task.status !== "needs_attention" && ["working", "answer_ready"].includes(app.status)) ? app.status : undefined;
+    applicationStatus.hidden = app.status === "unknown" || Boolean(progress) || Boolean(task && app.taskId === task.id);
+    applicationStatus.textContent = text(`agentApplication.${app.status}`, appLabels[app.status]);
     taskContainer.hidden = !task;
     if (!task) return;
     taskContainer.dataset.handoffStatus = task.status;
+    taskContainer.dataset.applicationStatus = progress ?? "";
     const labels = { waiting: "Waiting for answer", needs_attention: "Needs attention", completed: "Answer ready to collect", collected: "Answer collected", cancelled: "Task abandoned" };
-    taskCaption.textContent = text(`agentTask.${task.status}`, labels[task.status]);
-    taskNote.textContent = text(`agentTaskNote.${task.status}`, task.note ?? (task.completion === "agent_observed" ? text("agentObservedCompletion", "Completion reported by the visiting agent.") : task.status === "waiting" ? phase() === "connected" ? text("agentTaskWaiting", "Output alone does not confirm completion. The connection stays open.") : text("agentTaskDisconnected", "Task retained. Reconnect to retrieve further output.") : ""));
+    taskCaption.textContent = progress ? text(`agentApplication.${progress}`, appLabels[progress]) : text(`agentTask.${task.status}`, labels[task.status]);
+    const progressNote = progress === "authentication_required" ? phase() === "connected" ? text("agentAuthenticationRequired", "Sign in in the terminal. The session stays connected.") : text("agentAuthenticationDisconnected", "Sign in in the terminal. This task is retained.")
+      : progress === "working" ? phase() === "connected" ? text("agentApplicationWorking", "The application is working on this request. The connection stays open.") : text("agentApplicationWorkingDisconnected", "The application is working. Reconnect to retrieve further output.")
+      : progress === "answer_ready" ? text("agentApplicationAnswerReady", "The application has a response to retrieve. The agent still needs to collect the answer.")
+      : progress === "input_required" ? text("agentApplicationInputRequired", "Respond to the application's current dialog to continue.") : undefined;
+    taskNote.textContent = progressNote ?? text(`agentTaskNote.${task.status}`, task.note ?? (task.completion === "agent_observed" ? text("agentObservedCompletion", "Completion reported by the visiting agent.") : task.status === "waiting" ? phase() === "connected" ? text("agentTaskWaiting", "Output alone does not confirm completion. The connection stays open.") : text("agentTaskDisconnected", "Task retained. Reconnect to retrieve further output.") : ""));
     const result = task.resultAvailable ? session.tasks.get(task.id).result : undefined;
     taskResult.hidden = !result;
     taskResultLabel.textContent = result?.completion ? text("agentTaskAnswer", "Answer") : text("agentTaskPartial", "Output so far · completion unconfirmed");
     taskResultText.textContent = result?.text ?? "";
   }
-  const connectionSubscription = grant.onChange(() => { sync(); taskStatus(); }), taskSubscription = session.tasks.onChange(taskStatus), inputSubscription = session.onChange(inputStatus);
+  const connectionSubscription = grant.onChange(() => { sync(); taskStatus(); }), taskSubscription = session.tasks.onChange(taskStatus), inputSubscription = session.onChange(() => { inputStatus(); taskStatus(); });
   const timer = setInterval(updateExpiry, 1000);
   signal.addEventListener("abort", () => { connectionSubscription.dispose(); taskSubscription.dispose(); inputSubscription.dispose(); clearInterval(timer); }, { once: true });
   settingsChanged(false); sync(); taskStatus();

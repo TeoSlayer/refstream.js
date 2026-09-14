@@ -130,6 +130,10 @@ uncollected work. The browser owner can revoke access immediately.
 
 Completion comes from shell markers, a host callback, or an explicitly labelled
 observation by the visiting agent. Quiet output alone is never completion.
+Host integrations can report actual composer contents as empty, placeholder,
+suggestion or draft, and expose authentication, working and answer-ready states.
+Unintegrated applications retain an explicit unknown state and bounded visual
+evidence; terminal colors never authorize input on their own.
 See [persistent sessions and agent APIs](docs/agents.md) for usage, host hooks,
 retention limits and the distinction between terminal state and a live backend
 process.

@@ -1,6 +1,6 @@
 {
   "name": "refstream.js",
-  "version": "0.1.0-alpha.4",
+  "version": "0.1.0-alpha.5",
   "description": "An independent JavaScript terminal emulator with command state, customizable UI and optional peer-to-peer file streams.",
   "type": "module",
   "license": "MIT",

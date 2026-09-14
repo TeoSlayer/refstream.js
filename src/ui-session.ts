@@ -43,7 +43,8 @@ export function attachSessionTools(terminal: NativeTerminal, toolbar: HTMLElemen
         </details>
         <div class="terminal-pair-request"><button type="button" data-copy-invitation data-ui-text="copyInvitation">Copy invitation</button><span data-copy-status role="status"></span><textarea data-agent-message readonly hidden data-ui-aria="invitationMessage" aria-label="Message for your agent"></textarea></div>
         <div class="terminal-agent-connection"><div><p role="status" data-agent-status data-ui-text="agentDisconnected">No agent connected.</p><small data-agent-expiry hidden aria-live="off"></small></div><button type="button" data-panel-stop data-ui-text="stopAgent" hidden>Revoke access</button></div>
-        <div data-agent-input-guard hidden><p class="terminal-explorer-note" data-agent-input-note role="status"></p><button type="button" data-agent-input-allow data-ui-text="agentInputCleared">I've cleared my draft</button></div>
+        <p class="terminal-explorer-note" data-agent-application role="status" hidden></p>
+        <div data-agent-input-guard hidden><p class="terminal-explorer-note" data-agent-input-note role="status"></p><button type="button" data-agent-input-allow data-ui-text="agentInputConfirmEmpty">I've checked: input is empty</button></div>
         <div class="terminal-agent-task" data-agent-task hidden><p role="status" data-task-status></p><p class="terminal-explorer-note" data-task-note></p><details data-task-result hidden><summary data-task-result-label></summary><pre data-task-result-text></pre></details></div>
         <p class="terminal-explorer-note terminal-agent-privacy" data-ui-text="agentPrivacy">Only this terminal is shared. You can revoke access at any time.</p>
       </div>

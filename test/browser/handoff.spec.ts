@@ -24,7 +24,7 @@ test("real typing protects an un-echoed local draft from a fresh remote submit",
     catch (failure) { error = String(failure); }
     return { input: session.read().input, sent: window.fixture.input.join(""), error };
   });
-  expect(state).toMatchObject({ input: { state: "occupied", owner: "local" }, sent: "my draft" });
+  expect(state).toMatchObject({ input: { state: "unknown", content: "unknown", owner: "local", protected: true }, sent: "my draft" });
   expect(state.error).toContain("empty");
 });
 
@@ -67,4 +67,64 @@ test("UI remount preserves the default session and labels partial output as unco
   await page.locator("[data-task-result-label]").click();
   await expect(page.locator("[data-task-result-text]")).toHaveText("The requested findings.");
   expect(await page.evaluate(() => window.handoffSession.signal.aborted)).toBe(false);
+});
+
+test("suggested prompt reports survive rendering and cannot override active IME input", async ({ page }) => {
+  const initial = await page.evaluate(() => {
+    const { terminal } = window.fixture, session = window.handoffSession;
+    terminal.write("\x1b[?1049h\u276f \x1b[2;90mTry reviewing the changes\x1b[0m\r\x1b[2C");
+    session.reportApplicationState({ status: "ready", composer: "suggestion" }, session.sequence);
+    terminal.write("\x1b[2;1HRedraw\x1b[1;3H");
+    return session.read().input;
+  });
+  expect(initial).toMatchObject({ state: "empty", content: "suggestion", protected: false, verifiedBy: "host", screen: { semantics: "display_only", afterCursor: "Try reviewing the changes" } });
+  const composing = await page.evaluate(() => {
+    const { terminal } = window.fixture, session = window.handoffSession;
+    terminal.textarea!.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    let reportError = "", submitError = "";
+    try { session.reportApplicationState({ status: "ready", composer: "suggestion" }, session.sequence); }
+    catch (error) { reportError = String(error); }
+    try { session.ask("Review", "ime", session.sequence, { confirmEmptyInput: true }); }
+    catch (error) { submitError = String(error); }
+    return { reportError, submitError, input: session.input, sent: window.fixture.input };
+  });
+  expect(composing.reportError).toContain("composition is still active");
+  expect(composing.submitError).toContain("protected");
+  expect(composing.input.protected).toBe(true); expect(composing.sent).toEqual([]);
+  const recovered = await page.evaluate(() => {
+    const { terminal } = window.fixture, session = window.handoffSession;
+    const beforeCancel = session.sequence;
+    terminal.textarea!.dispatchEvent(new CompositionEvent("compositionend", { data: "", bubbles: true }));
+    if (session.sequence === beforeCancel || session.input.composing) throw new Error("Cancelled composition did not notify the session");
+    session.reportApplicationState({ status: "ready", composer: "placeholder" }, session.sequence);
+    session.ask("Review", "after-ime", session.sequence);
+    return window.fixture.input;
+  });
+  expect(recovered).toEqual(["Review", "\r"]);
+});
+
+test("application progress is customizable and answer readiness does not collect a task", async ({ page }) => {
+  await page.evaluate(async () => {
+    const { attachTerminalTools } = await import("/dist/ui.js");
+    const toolbar = document.createElement("div"), overlay = document.createElement("div");
+    overlay.style.cssText = "position:relative;width:100%;height:520px";
+    document.body.append(toolbar, overlay);
+    const { terminal } = window.fixture, session = window.handoffSession;
+    const controls = await attachTerminalTools({ terminal, session, toolbar, overlay, ui: { labels: { "agentApplication.working": "Review in progress" } } });
+    terminal.write("\x1b[?1049h");
+    session.ask("Review", "lifecycle", session.sequence, { confirmEmptyInput: true });
+    controls.openExplore("agent");
+    session.reportApplicationState({ status: "authentication_required", taskId: "lifecycle" }, session.sequence);
+  });
+  await expect(page.locator("[data-task-status]")).toHaveText("Authentication required");
+  await expect(page.locator("[data-task-note]")).toContainText("Sign in in the terminal");
+  await page.evaluate(() => { const session = window.handoffSession; session.reportApplicationState({ status: "working", taskId: "lifecycle" }, session.sequence); });
+  await expect(page.locator("[data-task-status]")).toHaveText("Review in progress");
+  await page.evaluate(() => { const session = window.handoffSession; session.reportApplicationState({ status: "answer_ready", taskId: "lifecycle", composer: "suggestion" }, session.sequence); });
+  await expect(page.locator("[data-task-status]")).toHaveText("Answer ready");
+  expect(await page.evaluate(() => window.handoffSession.readTask("lifecycle").task.status)).toBe("waiting");
+  await page.evaluate(() => { window.handoffSession.completeTask("lifecycle", "Verified findings."); });
+  await expect(page.locator("[data-task-status]")).toHaveText("Answer ready to collect");
+  await page.evaluate(() => { window.handoffSession.collectTask("lifecycle"); });
+  await expect(page.locator("[data-task-status]")).toHaveText("Answer collected");
 });

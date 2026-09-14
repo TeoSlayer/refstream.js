@@ -626,6 +626,7 @@ export class NativeTerminal implements TerminalSurface {
       this.composing = false;
       this.compositionCommit = event.data;
       if (event.data) this.emitInput(event.data);
+      else this.inputSignal.fire({ type: "composition" });
       textarea.value = "";
       clearTimeout(this.compositionTimer);
       this.compositionTimer = setTimeout(() => { this.compositionCommit = ""; }, 0);

@@ -8,6 +8,7 @@ import type { NativeTerminal, TerminalViewState } from "./native.js";
 import { encodeTerminalKey, type TerminalKey } from "./input.js";
 import { validateState } from "./state.js";
 import { TerminalTasks, validateTaskId, type TerminalTask, type TerminalTaskResult } from "./tasks.js";
+import { inspectCursorLine, validateApplicationReport, type TerminalApplicationReport, type TerminalApplicationState, type TerminalComposerContent, type TerminalInputState } from "./application.js";
 
 export interface InputReceipt { inputId: string; sequence: number; status: "sent"; commandId?: number }
 export interface SessionSnapshot {
@@ -41,6 +42,9 @@ export class TerminalSession implements Disposable {
   private inputRevision = 0;
   private inputOwner: "none" | "local" | "agent" | "unknown" = "unknown";
   private hostInputEmpty = false;
+  private composer?: TerminalComposerContent;
+  private applicationValue: TerminalApplicationState = { status: "unknown", source: null, revision: 0 };
+  private applicationBuffer: "normal" | "alternate";
   private inputSource = Symbol("session input");
   private lifetime = new AbortController();
   /** End of the logical session, independent of a toolbar or agent connection. */
@@ -49,14 +53,20 @@ export class TerminalSession implements Disposable {
   constructor(readonly terminal: NativeTerminal) {
     if (terminal.signal.aborted) throw new Error("Terminal has ended");
     this.commands = new CommandTracker(terminal.core);
+    this.applicationBuffer = terminal.core.type;
     this.onChange = this.change.event;
     const changed = () => this.change.fire(++this.sequenceValue);
     this.subscriptions = [terminal.core.activity.event(event => {
       if (event.type === "reset" || event.type === "restore") {
         this.executionPending = false; this.inputOwner = "unknown"; this.hostInputEmpty = false; this.inputRevision++;
+        this.clearApplicationState();
         this.tasks.attention("Terminal state changed. Inspect it before continuing the handoff.");
       }
       if (event.type === "write") {
+        if (this.applicationBuffer !== terminal.core.type) {
+          this.inputOwner = "unknown"; this.inputRevision++; this.clearApplicationState();
+          this.tasks.attention("The application buffer changed. Inspect the current application before continuing.");
+        }
         this.hostInputEmpty = false;
         this.tasks.output();
         for (const task of this.tasks.summary()) if (task.kind === "command" && task.commandId !== undefined && ["waiting", "needs_attention"].includes(task.status)) {
@@ -70,15 +80,15 @@ export class TerminalSession implements Disposable {
       changed();
     }), terminal.core.command.event(marker => {
       if (marker.kind === "output" || marker.kind === "finished" || marker.kind === "prompt") this.executionPending = false;
-      if (marker.kind === "command") this.inputOwner = "none";
+      if (marker.kind === "command") { this.inputOwner = "none"; this.clearApplicationState(); }
     }), terminal.onInput(event => {
-      this.hostInputEmpty = false;
+      this.hostInputEmpty = false; this.composer = undefined;
       if (event.source !== this.inputSource) {
         this.inputRevision++;
         // Enter may submit or insert a newline in an application. It leaves an
         // unverified composer, never a claimed-empty one.
         this.inputOwner = event.data === "\r" || event.data === "\r\n" || event.data === "\x03" ? "unknown" : "local";
-        this.tasks.attention("Someone else used the terminal. Inspect their input and the task before continuing.");
+        if (!["authentication_required", "input_required"].includes(this.applicationValue.status)) this.tasks.attention("Local input changed. Its effect on the application's composer is unverified; inspect before continuing.");
       }
       changed();
     }), this.tasks.onChange(changed)];
@@ -88,6 +98,7 @@ export class TerminalSession implements Disposable {
   }
   get id(): string { return this.sessionId; }
   get input() { return this.inputState(); }
+  get application(): TerminalApplicationState { return { ...this.applicationValue }; }
   get sequence(): number { return this.sequenceValue; }
   get recording(): TerminalRecorder | undefined { return this.recorder; }
   startRecording(maxBytes?: number): TerminalRecorder {
@@ -106,7 +117,7 @@ export class TerminalSession implements Disposable {
       viewportY: this.terminal.buffer.active.viewportY, selection: this.terminal.getSelection(),
       startRow: start, totalRows: core.length, droppedRows: core.history.dropped, lines,
       inputEnabled: !this.terminal.options.disableStdin, atPrompt: this.commands.atPrompt && !this.executionPending, executionPending: this.executionPending,
-      terminalSessionId: this.id, input: this.inputState(), tasks: this.tasks.summary(),
+      terminalSessionId: this.id, input: { ...this.inputState(), screen: inspectCursorLine(core) }, application: this.application, tasks: this.tasks.summary(),
       commands: this.commands.list().slice(-50).map(({ output: _output, ...record }) => record),
     };
   }
@@ -144,7 +155,8 @@ export class TerminalSession implements Disposable {
     const encoded = encodeTerminalKey(key, this.terminal.core.modes);
     if (!encoded) throw new TypeError("This key cannot be sent to the terminal");
     return this.send(inputId, JSON.stringify(["key", key]), expectedSequence, () => {
-      if (this.terminal.inputComposing || this.inputOwner === "local") throw new Error("Someone else's draft is present; nothing was sent. Leave their input unchanged.");
+      this.assertApplicationAvailable();
+      if (this.input.protected) throw new Error("Local input is protected; its composer may contain a draft. Nothing was sent. Leave input unchanged.");
       if ((/[\r\n]/u.test(encoded) || key.key === "Enter") && this.inputOwner !== "agent") throw new Error("No agent-owned draft to submit. Use ask to submit a new message atomically.");
       if (/[\r\n]/u.test(encoded) || key.key === "Enter") this.inputOwner = "unknown";
       else if (encoded.length === 1 && encoded >= " " && encoded !== "\x7f") {
@@ -155,13 +167,15 @@ export class TerminalSession implements Disposable {
   }
   execute(command: string, inputId: string, expectedSequence?: number): InputReceipt {
     return this.send(inputId, JSON.stringify(["execute", command]), expectedSequence, () => {
+      this.assertApplicationAvailable();
       if (!command || /[\x00-\x1f\x7f]/u.test(command)) throw new TypeError("execute accepts one command line; use sendText for interactive or multiline input");
       if (this.executionPending) throw new Error("Previous input is awaiting a shell boundary; inspect state or wait before executing another command");
       if (!this.commands.atPrompt || this.inputState().state !== "empty") throw new Error("No empty, explicitly marked shell prompt. Existing input was left unchanged.");
       this.executionPending = true;
       const revision = this.inputRevision;
       this.inputOwner = "agent"; this.terminal.paste(command, this.inputSource);
-      if (revision !== this.inputRevision || this.terminal.inputComposing) throw new Error("Input changed before submission. Inspect the terminal before retrying.");
+      if (revision !== this.inputRevision || this.input.owner !== "agent" || this.input.protected || this.terminal.inputComposing) throw new Error("Input changed before submission. Inspect the terminal before retrying.");
+      this.assertApplicationAvailable();
       this.inputOwner = "unknown"; this.terminal.sendKey({ key: "Enter" }, this.inputSource);
     }, this.commands.active?.id);
   }
@@ -176,6 +190,7 @@ export class TerminalSession implements Disposable {
       return previous;
     }
     this.assertSequence(expectedSequence);
+    this.assertApplicationAvailable();
     if (this.tasks.pending.length) throw new Error("Collect the previous answer before starting another task. Keep this session connected.");
     if (this.executionPending) throw new Error("Previous input is awaiting a shell boundary. Nothing was sent.");
     if (kind === "command") {
@@ -186,6 +201,8 @@ export class TerminalSession implements Disposable {
       if (/[\r\n\t]/u.test(prompt) && !this.terminal.core.modes.bracketedPasteMode) throw new Error("Multiline messages require bracketed paste; nothing was sent");
     }
     const revision = this.inputRevision;
+    // A previous turn's lifecycle is not progress for the new request.
+    this.applicationValue = { status: "unknown", source: null, revision: this.applicationValue.revision + 1 };
     this.tasks.begin({ id: taskId, prompt, kind, submittedSequence: this.sequence, ...(kind === "command" ? { commandId: this.commands.active?.id } : {}) });
     // The task exists before either input event, so even immediate shell output
     // has somewhere to report completion. Never roll back and retry input.
@@ -194,7 +211,8 @@ export class TerminalSession implements Disposable {
       if (kind === "command") this.executionPending = true;
       this.inputOwner = "agent";
       this.terminal.paste(prompt, this.inputSource);
-      if (revision !== this.inputRevision || this.terminal.inputComposing) throw new Error("Input changed before submission. The task needs inspection; do not retry it with a new ID.");
+      if (revision !== this.inputRevision || this.input.owner !== "agent" || this.input.protected || this.terminal.inputComposing) throw new Error("Input changed before submission. The task needs inspection; do not retry it with a new ID.");
+      this.assertApplicationAvailable();
       this.inputOwner = "unknown"; this.terminal.sendKey({ key: "Enter" }, this.inputSource);
     } catch (error) { this.tasks.attention("Submission was interrupted. Inspect the terminal before retrying; delivery may be partial."); throw error; }
     return this.tasks.get(taskId);
@@ -216,13 +234,44 @@ export class TerminalSession implements Disposable {
   /** A trusted host adapter can supply actual application completion, without screen guessing. */
   completeTask(taskId: string, answer: string, options: { truncated?: boolean } = {}): TerminalTask {
     this.assertLive();
-    return this.tasks.complete(taskId, { text: answer, truncated: options.truncated === true, sequence: this.sequence, completion: "host" });
+    const task = this.tasks.complete(taskId, { text: answer, truncated: options.truncated === true, sequence: this.sequence, completion: "host" });
+    this.applicationValue = { status: "answer_ready", source: "host", taskId, revision: this.applicationValue.revision + 1 };
+    this.change.fire(++this.sequenceValue); return task;
   }
-  /** Host-only composer acknowledgement. Call after the application reports its input is empty. */
+  /**
+   * Trusted host integration only. Observe real application state after capturing
+   * the sequence, and report before it changes. Decorative terminal text is not
+   * evidence. Report every composer/context change, and unknown on detachment.
+   */
+  reportApplicationState(report: TerminalApplicationReport, expectedSequence: number): void {
+    this.assertLive(); validateApplicationReport(report); this.assertSequence(expectedSequence);
+    if (report.taskId !== undefined) {
+      const task = this.tasks.get(report.taskId);
+      if (["completed", "collected", "cancelled"].includes(task.status)) throw new Error("Application progress belongs to a closed task");
+    }
+    if (report.composer !== undefined && this.terminal.inputComposing) throw new Error("Keyboard composition is still active; wait for committed input");
+    const empty = ["empty", "placeholder", "suggestion"].includes(report.composer ?? "");
+    if (empty && this.commands.atPrompt && this.commands.inputText) throw new Error("The marked shell prompt still contains input");
+    const changed = report.status !== this.applicationValue.status || report.taskId !== this.applicationValue.taskId || this.applicationValue.source !== "host" || report.composer !== undefined && report.composer !== this.composer;
+    this.applicationValue = { status: report.status, source: "host", revision: this.applicationValue.revision + 1, ...(report.taskId === undefined ? {} : { taskId: report.taskId }) };
+    if (report.status === "unknown" || report.status === "working" || report.status === "authentication_required" || report.status === "input_required") { this.composer = undefined; this.hostInputEmpty = false; }
+    if (report.composer !== undefined) {
+      this.composer = report.composer; this.hostInputEmpty = false;
+      // A report knows whether a value exists, not who authored it. It must
+      // never confer submission ownership on a visiting agent.
+      this.inputOwner = empty ? "none" : report.composer === "draft" ? "local" : this.inputOwner;
+    }
+    if (changed) this.tasks.applicationChanged(report.taskId);
+    this.change.fire(++this.sequenceValue);
+  }
+  /** Owner acknowledgement for an unintegrated TUI; cannot contradict a host-reported draft. */
   confirmInputEmpty(expectedRevision: number): void {
     this.assertLive(true);
-    if (expectedRevision !== this.inputRevision || this.terminal.inputComposing || this.commands.atPrompt && Boolean(this.commands.inputText)) throw new Error("Input changed; inspect the application's composer again");
-    this.inputOwner = "none"; this.hostInputEmpty = true; this.change.fire(++this.sequenceValue);
+    if (expectedRevision !== this.inputRevision || this.terminal.inputComposing || this.composer === "draft" || this.commands.atPrompt && Boolean(this.commands.inputText)) throw new Error("Input changed; inspect the application's composer again");
+    const changed = this.input.state !== "empty" || this.input.protected;
+    this.inputOwner = "none"; this.hostInputEmpty = true;
+    if (changed) this.tasks.applicationChanged();
+    this.change.fire(++this.sequenceValue);
   }
   collectTask(taskId: string, options: { expectedSequence?: number; answer?: string; completion?: "agent_observed" } = {}) {
     this.assertLive();
@@ -251,19 +300,40 @@ export class TerminalSession implements Disposable {
     const pending = this.tasks.pending;
     if (pending.length) throw new Error(`Task ${pending[0].id} still needs an answer or collection. Keep the session connected, collect the answer, or explicitly abandon the task before stopping.`);
   }
-  private taskNext(taskId: string): "wait" | "inspect" | "collect" | "done" {
+  private taskNext(taskId: string): "wait" | "inspect" | "collect" | "done" | "authenticate" {
     const status = this.tasks.get(taskId).status;
-    return status === "waiting" ? "wait" : status === "needs_attention" ? "inspect" : status === "completed" ? "collect" : "done";
+    if (status === "completed") return "collect";
+    if (status === "collected" || status === "cancelled") return "done";
+    const app = this.applicationValue;
+    if (app.status === "authentication_required") return "authenticate";
+    if (status !== "needs_attention" && app.taskId === taskId && app.status === "working") return "wait";
+    if (app.status === "input_required" || app.taskId === taskId && ["answer_ready", "ready"].includes(app.status)) return "inspect";
+    return status === "needs_attention" ? "inspect" : "wait";
   }
-  private inputState() {
-    const state = this.terminal.inputComposing || this.inputOwner === "local" || this.inputOwner === "agent" || this.commands.atPrompt && Boolean(this.commands.inputText)
-      ? "occupied" : !this.executionPending && (this.hostInputEmpty || this.commands.atPrompt && this.inputOwner === "none") ? "empty" : "unknown";
-    return { state, owner: this.inputOwner, revision: this.inputRevision, composing: this.terminal.inputComposing, verifiedBy: state === "empty" ? this.hostInputEmpty ? "host" : "shell" : null };
+  private inputState(): TerminalInputState {
+    const composing = this.terminal.inputComposing, shellDraft = this.commands.atPrompt && Boolean(this.commands.inputText);
+    const content = this.composer ?? (this.inputOwner === "agent" || shellDraft ? "draft" : !this.executionPending && (this.hostInputEmpty || this.commands.atPrompt && this.inputOwner === "none") ? "empty" : "unknown");
+    const state = composing || content === "draft" ? "occupied" : ["empty", "placeholder", "suggestion"].includes(content) ? "empty" : "unknown";
+    return { state, content, owner: this.inputOwner, revision: this.inputRevision, composing,
+      protected: composing || this.inputOwner === "local" || content === "draft" && this.inputOwner !== "agent",
+      verifiedBy: this.composer && this.composer !== "unknown" ? "host" : shellDraft || state === "empty" && this.commands.atPrompt ? "shell" : this.hostInputEmpty ? "owner" : null };
   }
   private assertInputAvailable(confirmEmpty: boolean, append = false): void {
+    this.assertApplicationAvailable();
     const input = this.inputState();
-    if (input.composing || input.owner === "local" || input.state === "occupied" && !(append && input.owner === "agent")) throw new Error("Someone else's draft may be present; nothing was sent. Leave existing input unchanged.");
-    if (input.state === "unknown" && !confirmEmpty) throw new Error("This application does not report an empty composer. Inspect it, then use confirmEmptyInput only if you verified it is empty. Nothing was sent.");
+    if (input.protected || input.state === "occupied" && !(append && input.owner === "agent")) throw new Error("Local input is protected; its composer may contain a draft. Nothing was sent. Leave input unchanged.");
+    if (input.state === "unknown" && !confirmEmpty) throw new Error("Composer state is unknown, not a confirmed draft. Placeholder and suggested text may be visible even when the editable value is empty. Inspect input.screen, then use confirmEmptyInput only after verifying an empty composer. Nothing was sent.");
+  }
+  private assertApplicationAvailable(): void {
+    if (this.applicationValue.status === "authentication_required") throw new Error("Authentication required. Keep the session connected while its owner signs in; do not type credentials or a prompt.");
+    if (this.applicationValue.status === "working") throw new Error("The application is working. Wait for its answer before sending more input.");
+    if (this.applicationValue.status === "input_required") throw new Error("The application needs a response to its current dialog. Inspect it before continuing; a new prompt was not sent.");
+  }
+  private clearApplicationState(): void {
+    const changed = this.applicationValue.source !== null || this.composer !== undefined;
+    this.composer = undefined; this.hostInputEmpty = false; this.applicationBuffer = this.terminal.core.type;
+    this.applicationValue = { status: "unknown", source: null, revision: this.applicationValue.revision + 1 };
+    if (changed) this.tasks.applicationChanged();
   }
   private assertSequence(expected: number | undefined): void {
     if (expected === undefined || expected !== this.sequence) throw new Error("Terminal state changed or no recent sequence was supplied; read it again before sending input");

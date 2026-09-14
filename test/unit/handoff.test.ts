@@ -154,7 +154,7 @@ describe("draft and concurrency protection", () => {
   it("blocks an unverified application composer unless its empty state was explicitly inspected", () => {
     const { session, sent } = fixture(true);
     expect(session.read().input.state).toBe("unknown");
-    expect(() => session.ask("Review", "review", session.sequence)).toThrow("does not report an empty composer");
+    expect(() => session.ask("Review", "review", session.sequence)).toThrow("Composer state is unknown");
     expect(sent).toEqual([]); expect(session.tasks.list()).toEqual([]);
     session.ask("Review", "review", session.sequence, { confirmEmptyInput: true });
     expect(sent).toEqual(["\x1b[200~Review\x1b[201~", "\r"]);
@@ -164,7 +164,7 @@ describe("draft and concurrency protection", () => {
     const { terminal, session, sent } = fixture();
     const before = session.sequence; terminal.paste("someone else's draft");
     expect(session.commands.inputText).toBe("");
-    expect(session.read().input).toMatchObject({ state: "occupied", owner: "local" });
+    expect(session.read().input).toMatchObject({ state: "unknown", content: "unknown", owner: "local", protected: true });
     expect(() => session.execute("pwd", "stale", before)).toThrow("state changed");
     expect(() => session.execute("pwd", "fresh", session.sequence)).toThrow("empty");
     for (const args of [{ key: "Enter" }, { key: "m", ctrl: true }, { key: "j", ctrl: true }]) {
@@ -221,10 +221,10 @@ describe("draft and concurrency protection", () => {
     expect(sent).toHaveLength(2);
   });
 
-  it("supports a host-confirmed empty composer while keeping shell execution separate", () => {
+  it("supports an owner-acknowledged empty composer while keeping shell execution separate", () => {
     const { terminal, session } = fixture(true);
     session.confirmInputEmpty(session.read().input.revision);
-    expect(session.read().input).toMatchObject({ state: "empty", verifiedBy: "host" });
+    expect(session.read().input).toMatchObject({ state: "empty", verifiedBy: "owner" });
     expect(() => session.execute("pwd", "not-shell", session.sequence)).toThrow("shell prompt");
     terminal.write("redraw"); expect(session.read().input.state).toBe("unknown");
     session.confirmInputEmpty(session.read().input.revision);
